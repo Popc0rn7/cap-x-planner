@@ -1,4 +1,5 @@
 from .base_api import list_apis, register_api
+from .vla import build_vla_primitive_api
 from .franka.control import FrankaControlApi
 from .franka.control_privileged import FrankaControlPrivilegedApi
 from .franka.control_reduced import FrankaControlApiReduced
@@ -25,6 +26,7 @@ except ImportError:
     print("LIBERO not installed, skipping LIBERO APIs")
 
 register_api("FrankaControlPrivilegedApi", FrankaControlPrivilegedApi)
+register_api("VlaPrimitiveApi", build_vla_primitive_api)
 register_api("FrankaControlApi", lambda env: FrankaControlApi(env, use_sam3=True))
 register_api("FrankaControlApiReduced", FrankaControlApiReduced)
 register_api(

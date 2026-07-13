@@ -1,0 +1,49 @@
+# In-process Harness VLA smoke config. No VLA inference server is required.
+
+env:
+  _target_: capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.libero.FrankaLiberoEnv
+      suite_name: libero_object_swap
+      task_id: 0
+      privileged: true
+      max_steps: 8000
+      control_freq: 20
+    privileged: true
+    apis:
+      - FrankaLiberoPrivilegedApi
+      - name: VlaPrimitiveApi
+        config:
+          model:
+            type: mock
+            actions:
+              - [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0]
+            done: true
+          action_adapter: identity
+          primitive:
+            default_max_chunks: 1
+    prompt: |
+      You are testing the Harness VLA primitive on a Franka robot.
+      Goal: {libero_environment_goal}
+      Call vla_act once and print its result. Write only executable Python code.
+    multi_turn_prompt: |
+      Executed code:
+      ```python
+      {executed_code}
+      ```
+      Console stdout:
+      ```
+      {console_stdout}
+      ```
+      Console stderr:
+      ```
+      {console_stderr}
+      ```
+      Respond with exactly FINISH, or REGENERATE followed by a Python code block.
+
+record_video: true
+output_dir: ./outputs/franka_libero_harness_vla_mock
+trials: 1
+num_workers: 1

@@ -2,7 +2,7 @@ import contextlib
 import io
 import sys
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, SupportsFloat
 
@@ -34,18 +34,26 @@ class Tee(io.TextIOBase):
 
 
 @dataclass
+class ApiSpec:
+    """Deferred API construction spec evaluated after the low-level env exists."""
+
+    name: str
+    config: dict[str, Any] | None = None
+
+
+@dataclass
 class CodeExecEnvConfig:
     """Configuration for a code-execution environment.
 
     Attributes:
         low_level: A constructed low-level env or a YAML path to its config.
-        apis: List of API names to expose to user code (e.g., "graspnet-real").
+        apis: API names or deferred structured API specs exposed to user code.
         prompt: Task instruction for the agent.
         multi_turn_prompt: Instruction for the agent to regenerate the code for multi-turn.
     """
 
     low_level: Env | str
-    apis: list[str]
+    apis: list[str | ApiSpec | dict[str, Any]]
     prompt: str | None = None
     task_only_prompt: str | None = None
     multi_turn_prompt: str | None = None
@@ -95,7 +103,12 @@ class CodeExecutionEnvBase(Env):
             cfg.low_level, cfg.privileged, cfg.enable_render, cfg.viser_debug
         )  # type: ignore[assignment]
         # Create APIs once; maximize sharing inside a worker via lru_cache in get_api
-        self._apis: dict[str, ApiBase] = {n: get_api(n)(self.low_level_env) for n in cfg.apis}
+        self._apis: dict[str, ApiBase] = {}
+        for api_spec in cfg.apis:
+            name, api = self._build_api(api_spec)
+            if name in self._apis:
+                raise ValueError(f"Duplicate API name in config: {name}")
+            self._apis[name] = api
         # for api in self._apis.values():
         #     api.set_env(self.low_level_env)
         self._executor = SimpleExecutor(self.low_level_env, self._apis)
@@ -136,6 +149,31 @@ class CodeExecutionEnvBase(Env):
         return self.low_level_env.compute_reward()
 
     # ---- Private methods ----
+    def _build_api(
+        self,
+        spec: str | ApiSpec | Mapping[str, Any],
+    ) -> tuple[str, ApiBase]:
+        """Build one API, deferring structured specs until the env is available."""
+        if isinstance(spec, str):
+            return spec, get_api(spec)(self.low_level_env)
+        if isinstance(spec, ApiSpec):
+            name = spec.name
+            config = spec.config
+        elif isinstance(spec, Mapping):
+            unknown = set(spec) - {"name", "config"}
+            if unknown:
+                raise ValueError(f"Unknown API spec keys: {sorted(unknown)}")
+            name = spec.get("name")
+            config = spec.get("config")
+        else:
+            raise TypeError(f"API spec must be a string or mapping, got {type(spec).__name__}")
+
+        if not isinstance(name, str) or not name:
+            raise ValueError("Structured API spec requires a non-empty 'name'")
+        if config is not None and not isinstance(config, dict):
+            raise TypeError(f"API '{name}' config must be a mapping")
+        return name, get_api(name)(self.low_level_env, config=config)
+
     def _get_complete_prompt(self) -> str:
         """
         Get the complete prompt for the task.

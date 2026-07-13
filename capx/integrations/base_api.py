@@ -121,15 +121,15 @@ class ApiBase(ABC):
         return "\n".join(lines).strip()
 
 
-_API_FACTORIES: dict[str, Callable[[], ApiBase]] = {}
+_API_FACTORIES: dict[str, Callable[..., ApiBase]] = {}
 
 
-def register_api(name: str, factory: Callable[[], ApiBase]) -> None:
+def register_api(name: str, factory: Callable[..., ApiBase]) -> None:
     _API_FACTORIES[name] = factory
 
 
 @lru_cache(maxsize=256)
-def get_api(name: str) -> Callable[[BaseEnv], ApiBase]:
+def get_api(name: str) -> Callable[..., ApiBase]:
     if name not in _API_FACTORIES:
         raise KeyError(f"API '{name}' not registered")
     return _API_FACTORIES[name]

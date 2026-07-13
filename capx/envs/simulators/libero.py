@@ -209,6 +209,55 @@ class FrankaLiberoEnv(BaseEnv):
 
     # ----------------------- FrankaControlApi Interface -----------------------
 
+    def execute_policy_action(self, action: np.ndarray) -> dict[str, Any]:
+        """Execute one native LIBERO policy action and refresh cached state.
+
+        This is the supported boundary for learned-policy primitives. The action
+        must already match the controller configured by the loaded LIBERO task;
+        model-specific action conversion belongs in the VLA inference service.
+
+        Args:
+            action: One finite native controller action.
+
+        Returns:
+            Transition diagnostics containing reward, done, and simulator info.
+        """
+        native_action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if native_action.size == 0 or not np.isfinite(native_action).all():
+            raise ValueError("Policy action must be a non-empty finite vector")
+
+        self._current_obs, self._current_reward, self._current_done, self._current_info = (
+            self.handle.step(native_action)
+        )
+        self._sim_step_count += 1
+
+        current = np.array(
+            self.handle.env.sim.data.qpos[self._panda_joint_qpos_addrs], dtype=np.float64
+        )
+        self._current_joints = current
+        # LIBERO convention: -1 is open and +1 is closed.
+        self._gripper_fraction = float(np.clip((1.0 - native_action[-1]) / 2.0, 0.0, 1.0))
+        self.gripper_link_wxyz_xyz = np.concatenate(
+            [
+                self.handle.env.sim.data.xquat[self.gripper_link_idx],
+                self.handle.env.sim.data.xpos[self.gripper_link_idx],
+            ]
+        )
+
+        if self.viser_debug and self._sim_step_count % self._subsample_rate == 0:
+            if self._sim_step_count % self._full_viser_rate == 0:
+                self._update_viser_server()
+            else:
+                self._update_viser_robot_only()
+        if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
+            self._record_frame()
+
+        return {
+            "reward": float(self._current_reward),
+            "done": bool(self._current_done),
+            "info": self._current_info,
+        }
+
     def move_to_joints_blocking(
         self, joints: np.ndarray, *, tolerance: float = 0.01, max_steps: int = 120
     ) -> None:

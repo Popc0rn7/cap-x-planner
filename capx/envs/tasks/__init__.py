@@ -1,4 +1,5 @@
 from .base import (
+    ApiSpec,
     CodeExecEnvConfig,
     CodeExecutionEnvBase,
     get_config,
