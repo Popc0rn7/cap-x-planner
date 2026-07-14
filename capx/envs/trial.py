@@ -19,13 +19,14 @@ import io
 import json
 import os
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from PIL import Image
 
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
+from capx.envs.trial_base import TrialContext, TrialExecutorBase
 
 from capx.llm.client import (
     VLM_MODELS,
@@ -45,9 +46,6 @@ from capx.utils.launch_utils import (
 )
 from capx.utils.video_utils import _encode_video_base64, _write_video
 
-# Use TYPE_CHECKING to avoid circular imports for type hints only
-from typing import TYPE_CHECKING
-
 if TYPE_CHECKING:
     from capx.envs.launch import LaunchArgs
 
@@ -64,7 +62,7 @@ def _annotate_code_blocks(
 ) -> str:
     """Join code blocks into a single string with ``# Code block N`` headers."""
     annotated = []
-    for i, (block, metadata) in enumerate(zip(code_blocks, code_block_metadata, strict=False)):
+    for i, (block, _metadata) in enumerate(zip(code_blocks, code_block_metadata, strict=False)):
         annotated.append(f"# Code block {i}\n{block}")
     return "\n\n".join(annotated)
 
@@ -973,4 +971,92 @@ def _patch_libero_goal(env: CodeExecutionEnvBase, obs: dict[str, Any]) -> None:
             obs["full_prompt"][-1]["content"][0]["text"].format(
                 libero_environment_goal=goal
             )
+        )
+
+
+class CodeAgentTrialExecutor(TrialExecutorBase):
+    """Adapter preserving the existing generated-Python trial algorithm."""
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self.config = dict(config or {})
+
+    def run(self, context: TrialContext) -> TrialSummary:
+        return _run_single_trial(
+            context.env,
+            context.trial,
+            context.args,
+            context.runtime_config,
+            context.multi_turn_prompt,
+            partial_artifacts=context.partial_artifacts,
+        )
+
+    def build_timeout_summary(
+        self,
+        context: TrialContext,
+        timeout_seconds: int,
+        exc: BaseException,
+    ) -> TrialSummary:
+        """Retain generated code and visual artifacts after a timeout."""
+
+        artifacts = context.partial_artifacts
+        raw_code = artifacts.get("raw_code", "")
+        code_blocks = artifacts.get("code_blocks", [])
+        code_block_metadata = artifacts.get("code_block_metadata", [])
+        final_code = _annotate_code_blocks(code_blocks, code_block_metadata)
+
+        info_step = artifacts.get(
+            "info_step",
+            {"sandbox_rc": 1, "stdout": "", "stderr": str(exc)},
+        )
+        info_step = dict(info_step)
+        if info_step.get("stderr", ""):
+            info_step["stderr"] += f"\n\nTimeout Error: {exc}"
+        else:
+            info_step["stderr"] = str(exc)
+
+        reward = artifacts.get("reward", 0.0)
+        terminated = artifacts.get("terminated", False)
+        truncated = artifacts.get("truncated", False)
+        num_regenerations = artifacts.get("num_regenerations", 0)
+        num_finishes = artifacts.get("num_finishes", 0)
+        num_code_blocks = artifacts.get("num_code_blocks", len(code_blocks))
+        log_lines = _build_log_lines(
+            final_code,
+            info_step,
+            reward,
+            terminated,
+            truncated,
+            num_regenerations,
+            num_finishes,
+            num_code_blocks,
+            prefix=f"Trial {context.trial} timed out after {timeout_seconds} seconds.",
+        )
+        code_path = _save_trial_artifacts(
+            context.runtime_config,
+            context.trial,
+            sandbox_rc=1,
+            reward=reward,
+            task_completed=info_step.get("task_completed", False),
+            final_code=final_code,
+            raw_code=raw_code,
+            all_responses=artifacts.get("all_responses", []),
+            log_lines=log_lines,
+            visual_feedback_imgs=artifacts.get("visual_feedback_imgs", []),
+            ensemble_data=artifacts.get("ensemble_data"),
+            multiturn_ensemble_data=artifacts.get("multiturn_ensemble_data", []),
+        )
+
+        return TrialSummary(
+            trial=context.trial,
+            success=False,
+            reward=reward,
+            terminated=terminated,
+            truncated=truncated,
+            sandbox_rc=1,
+            log="\n".join(log_lines),
+            task_completed=info_step.get("task_completed", False),
+            code_path=code_path,
+            num_regenerations=num_regenerations,
+            num_finishes=num_finishes,
+            num_code_blocks=num_code_blocks,
         )

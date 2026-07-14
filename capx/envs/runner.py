@@ -1,8 +1,7 @@
 """Trial orchestration for CaP-X environments.
 
-Handles batch execution, parallel worker dispatch, retry logic, and
-wall-clock timeouts for running code-generation trials.  The actual
-single-trial execution lives in :mod:`capx.envs.trial`.
+Handles batch execution, parallel worker dispatch, retry logic, and wall-clock timeouts.
+The actual single-trial algorithm is selected by the configured trial executor.
 """
 
 from __future__ import annotations
@@ -18,16 +17,11 @@ from typing import Any
 from tqdm import tqdm
 
 from capx.envs.configs.instantiate import instantiate
-from capx.envs.tasks.base import CodeExecutionEnvBase
-from capx.envs.trial import (
-    _annotate_code_blocks,
-    _build_log_lines,
-    _run_single_trial,
-)
+from capx.envs.trial_base import TrialContext
+from capx.envs.trial_factory import build_trial_executor
 from capx.utils.launch_utils import (
     TrialSummary,
     _print_and_save_summary,
-    _save_trial_artifacts,
     run_server_proc,
 )
 from capx.utils.parallel_eval import run_parallel_with_setup
@@ -193,7 +187,7 @@ def _run_single_trial_worker(
 
 
 def _run_trial_with_retries(
-    env: CodeExecutionEnvBase,
+    env: Any,
     trial: int,
     args,
     config: dict[str, Any],
@@ -272,7 +266,7 @@ def _run_trial_batch(
 # ---------------------------------------------------------------------------
 
 def _run_single_trial_with_timeout(
-    env: CodeExecutionEnvBase,
+    env: Any,
     trial: int,
     args,
     config: dict[str, Any],
@@ -289,13 +283,20 @@ def _run_single_trial_with_timeout(
         timed_out = True
         raise TimeoutError(f"Trial {trial} exceeded {timeout_seconds} seconds")
 
+    partial_artifacts: dict[str, Any] = {}
+    trial_executor = build_trial_executor(config.get("trial_executor"))
+    context = TrialContext(
+        env=env,
+        trial=trial,
+        args=args,
+        runtime_config=config,
+        multi_turn_prompt=multi_turn_prompt,
+        partial_artifacts=partial_artifacts,
+    )
     previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(timeout_seconds)
-    partial_artifacts: dict[str, Any] = {}
     try:
-        return _run_single_trial(
-            env, trial, args, config, multi_turn_prompt, partial_artifacts=partial_artifacts
-        )
+        return trial_executor.run(context)
     except BaseException as exc:
         is_timeout = timed_out or isinstance(exc, TimeoutError)
         try:
@@ -310,69 +311,7 @@ def _run_single_trial_with_timeout(
             raise TimeoutError(f"Trial {trial} timed out") from exc
 
         print(f"Trial {trial} timed out after {timeout_seconds} seconds")
-        return _build_timeout_summary(trial, timeout_seconds, partial_artifacts, config, exc)
+        return trial_executor.build_timeout_summary(context, timeout_seconds, exc)
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_handler)
-
-
-def _build_timeout_summary(
-    trial: int,
-    timeout_seconds: int,
-    pa: dict[str, Any],
-    config: dict[str, Any],
-    exc: BaseException,
-) -> TrialSummary:
-    """Build a TrialSummary from partial artifacts after a timeout."""
-    raw_code = pa.get("raw_code", "")
-    code_blocks = pa.get("code_blocks", [])
-    code_block_metadata = pa.get("code_block_metadata", [])
-    final_code = _annotate_code_blocks(code_blocks, code_block_metadata)
-
-    info_step = pa.get("info_step", {"sandbox_rc": 1, "stdout": "", "stderr": str(exc)})
-    if info_step.get("stderr") == "":
-        info_step["stderr"] = str(exc)
-    else:
-        info_step["stderr"] += f"\n\nTimeout Error: {exc}"
-
-    reward = pa.get("reward", 0.0)
-    terminated = pa.get("terminated", False)
-    truncated = pa.get("truncated", False)
-    num_regenerations = pa.get("num_regenerations", 0)
-    num_finishes = pa.get("num_finishes", 0)
-    num_code_blocks = pa.get("num_code_blocks", len(code_blocks))
-
-    log_lines = _build_log_lines(
-        final_code, info_step, reward, terminated, truncated,
-        num_regenerations, num_finishes, num_code_blocks,
-        prefix=f"Trial {trial} timed out after {timeout_seconds} seconds.",
-    )
-
-    code_path = _save_trial_artifacts(
-        config, trial,
-        sandbox_rc=1,
-        reward=reward,
-        task_completed=info_step.get("task_completed", False),
-        final_code=final_code,
-        raw_code=raw_code,
-        all_responses=pa.get("all_responses", []),
-        log_lines=log_lines,
-        visual_feedback_imgs=pa.get("visual_feedback_imgs", []),
-        ensemble_data=pa.get("ensemble_data"),
-        multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
-    )
-
-    return TrialSummary(
-        trial=trial,
-        success=False,
-        reward=reward,
-        terminated=terminated,
-        truncated=truncated,
-        sandbox_rc=1,
-        log="\n".join(log_lines),
-        task_completed=info_step.get("task_completed", False),
-        code_path=code_path,
-        num_regenerations=num_regenerations,
-        num_finishes=num_finishes,
-        num_code_blocks=num_code_blocks,
-    )

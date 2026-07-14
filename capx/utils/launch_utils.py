@@ -10,7 +10,7 @@ import logging
 import multiprocessing
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -64,6 +64,9 @@ class TrialSummary:
     num_regenerations: int = 0
     num_finishes: int = 0
     num_code_blocks: int = 0
+    stage_records: list[dict[str, Any]] = dataclass_field(default_factory=list)
+    num_stages: int = 0
+    num_stages_completed: int = 0
 
 
 def run_server_proc(api_cfg) -> multiprocessing.Process:
@@ -157,6 +160,12 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         if getattr(args, "web_ui_port", None) is not None
         else configs_dict.get("web_ui_port", 8200),
         "save_multiturn_prompts": configs_dict.get("save_multiturn_prompts", False),
+        # Trial selection is intentionally YAML-only for now. Existing configurations
+        # remain on the code-agent loop when this key is absent.
+        "trial_executor": configs_dict.get(
+            "trial_executor",
+            {"type": "code_agent"},
+        ),
     }
 
     return env_factory, merged_config, api_servers
