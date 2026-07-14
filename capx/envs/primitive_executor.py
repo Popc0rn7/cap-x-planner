@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from capx.envs.trial_fine_grained import ToolCall, ToolResult, WorldState
+from capx.planning.primitives import ToolCall, ToolResult, WorldState
 
 ToolFunction = Callable[..., Any]
 

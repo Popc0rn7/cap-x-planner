@@ -14,15 +14,22 @@ from __future__ import annotations
 import copy
 import json
 import time
-import uuid
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass, field
-from enum import StrEnum
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from capx.envs.configs.instantiate import instantiate, locate
 from capx.envs.trial_base import TrialContext, TrialExecutorBase
+from capx.planning.primitives import ToolCall, ToolResult, WorldState
+from capx.planning.recovery import (
+    FailureCode,
+    RecoveryAction,
+    RecoveryContext,
+    RecoveryDecision,
+    RecoveryPolicy,
+    classify_failure,
+)
 from capx.planning.stage_planner import Stage, TurnContext, TurnRole
 from capx.planning.stage_reward import (
     RewardStatus,
@@ -32,64 +39,7 @@ from capx.planning.stage_reward import (
 )
 from capx.utils.launch_utils import TrialSummary
 
-WorldState = dict[str, Any]
 Observation = dict[str, Any]
-
-
-class RecoveryAction(StrEnum):
-    """Control-flow decision after an unsuccessful primitive."""
-
-    RETRY = "retry"
-    RESTAGE = "restage"
-    REPLAN = "replan"
-    ABORT = "abort"
-
-
-@dataclass(frozen=True)
-class ToolCall:
-    """One planner-selected primitive invocation."""
-
-    action: str
-    target: Any | None = None
-    params: dict[str, Any] = field(default_factory=dict)
-    reward_rules: tuple[StageRewardRule, ...] = ()
-    # Deprecated constructor compatibility. New code should use reward_rules.
-    postconditions: tuple[dict[str, Any], ...] = ()
-    timeout_s: float = 10.0
-    id: str = field(default_factory=lambda: uuid.uuid4().hex)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "reward_rules", tuple(self.reward_rules))
-        object.__setattr__(self, "postconditions", tuple(self.postconditions))
-        if not self.action.strip():
-            raise ValueError("ToolCall.action must be non-empty")
-        if self.timeout_s <= 0:
-            raise ValueError("ToolCall.timeout_s must be positive")
-        if self.reward_rules and self.postconditions:
-            raise ValueError("ToolCall cannot define both reward_rules and postconditions")
-        if self.postconditions:
-            object.__setattr__(
-                self,
-                "reward_rules",
-                tuple(StageRewardRule.from_legacy(item) for item in self.postconditions),
-            )
-            object.__setattr__(self, "postconditions", ())
-        if any(not isinstance(rule, StageRewardRule) for rule in self.reward_rules):
-            raise TypeError("ToolCall.reward_rules entries must be StageRewardRule instances")
-        predicates = [rule.predicate for rule in self.reward_rules]
-        if len(predicates) != len(set(predicates)):
-            raise ValueError("ToolCall reward rule predicates must be unique")
-
-
-@dataclass(frozen=True)
-class ToolResult:
-    """Normalized result from a primitive executor."""
-
-    ok: bool
-    code: str
-    message: str = ""
-    updated_state: WorldState = field(default_factory=dict)
-    telemetry: dict[str, Any] = field(default_factory=dict)
 
 
 # Temporary import aliases for integrations written against the P0 verifier API.
@@ -98,31 +48,20 @@ VerificationVerdict = StageReward
 
 
 @dataclass(frozen=True)
-class RecoveryDecision:
-    """Recovery action and optional analytic calls used to re-stage the robot."""
-
-    action: RecoveryAction
-    tool_calls: tuple[ToolCall, ...] = ()
-    retry_failed_call: bool = True
-    message: str = ""
-
-    def __post_init__(self) -> None:
-        if self.action is RecoveryAction.RESTAGE and not self.tool_calls:
-            raise ValueError("RESTAGE requires at least one recovery ToolCall")
-
-
-@dataclass(frozen=True)
 class FineGrainedTrialConfig:
     """Budgets owned by the primitive-level trial loop."""
 
     max_turns: int = 50
     max_wall_time_s: float | None = None
+    max_replans: int = 2
 
     def __post_init__(self) -> None:
         if self.max_turns < 1:
             raise ValueError("max_turns must be at least 1")
         if self.max_wall_time_s is not None and self.max_wall_time_s <= 0:
             raise ValueError("max_wall_time_s must be positive when set")
+        if self.max_replans < 0:
+            raise ValueError("max_replans must be non-negative")
 
 
 class FineGrainedPlanner(Protocol):
@@ -149,6 +88,7 @@ class FineGrainedPlanner(Protocol):
         state: WorldState,
         failed_stage: Stage,
         reward: StageReward,
+        result: ToolResult | None = None,
     ) -> None:
         """Replace or revise the remaining stage plan."""
 
@@ -169,19 +109,6 @@ class StageRewardVerifier(Protocol):
 
 # Deprecated protocol name retained for configured integrations.
 Verifier = StageRewardVerifier
-
-
-class RecoveryPolicy(Protocol):
-    """Select retry, re-stage, replan, or abort after a failed verification."""
-
-    def decide(
-        self,
-        call: ToolCall,
-        state: WorldState,
-        reward: StageReward,
-        retry_count: int,
-    ) -> RecoveryDecision:
-        """Choose the next control-flow action."""
 
 
 class TrialMemory(Protocol):
@@ -291,6 +218,7 @@ def run_fine_grained_trial(
     stage_records: list[dict[str, Any]] = []
     retry_used = 0
     restage_used = 0
+    replans_used = 0
     turns_executed = 0
     stop_reason = "budget_exhausted"
 
@@ -304,6 +232,34 @@ def run_fine_grained_trial(
 
     state = components.memory.bootstrap(task_text, observation)
     components.planner.initialize(task_text, state)
+
+    def request_replan(
+        stage: Stage,
+        reward: StageReward,
+        result: ToolResult,
+        *,
+        turn: int,
+    ) -> bool:
+        nonlocal replans_used, stop_reason
+        if replans_used >= trial_config.max_replans:
+            stop_reason = "replan_budget_exhausted"
+            trace.append(
+                _trace_line(
+                    turn,
+                    "replan_budget_exhausted",
+                    stage_id=stage.id,
+                    replans_used=replans_used,
+                    replans_remaining=0,
+                )
+            )
+            return False
+        try:
+            components.planner.replan(task_text, state, stage, reward, result)
+        except TypeError:
+            # Compatibility for configured planners implementing the original P0 protocol.
+            components.planner.replan(task_text, state, stage, reward)
+        replans_used += 1
+        return True
 
     for turn in range(trial_config.max_turns):
         if _task_completed(env):
@@ -463,6 +419,7 @@ def run_fine_grained_trial(
                 RecoveryDecision(
                     action=RecoveryAction.ABORT,
                     message=f"unsafe:{stage_reward.code}",
+                    failure_code=FailureCode.UNSAFE,
                 ),
                 state,
             )
@@ -489,6 +446,7 @@ def run_fine_grained_trial(
                 RecoveryDecision(
                     action=RecoveryAction.REPLAN,
                     message="restage repair failed",
+                    failure_code=classify_failure(result, stage_reward),
                 ),
                 state,
             )
@@ -517,12 +475,29 @@ def run_fine_grained_trial(
                     reason=stage_reward.code,
                 )
             )
-            components.planner.replan(task_text, state, stage, stage_reward)
+            if not request_replan(stage, stage_reward, result, turn=turn):
+                break
             current_stage = None
             current_record = None
             continue
 
-        decision = components.recovery_policy.decide(call, state, stage_reward, retry_used)
+        recovery_context = RecoveryContext(
+            turn=context,
+            stage=stage,
+            call=call,
+            result=result,
+            state=state,
+            reward=stage_reward,
+            retries_used=retry_used,
+            restages_used=restage_used,
+        )
+        try:
+            decision = components.recovery_policy.decide(recovery_context)
+        except TypeError:
+            # Compatibility for configured policies implementing the original P0 protocol.
+            decision = components.recovery_policy.decide(  # type: ignore[call-arg]
+                call, state, stage_reward, retry_used
+            )
         components.memory.record_recovery(context, decision, state)
         trace.append(
             _trace_line(
@@ -532,6 +507,7 @@ def run_fine_grained_trial(
                 turn_role=scheduled.role.value,
                 call_id=call.id,
                 action=decision.action.value,
+                failure_code=decision.failure_code.value,
                 message=decision.message,
                 retries_used=retry_used,
                 retries_remaining=stage.retry_budget - retry_used,
@@ -566,7 +542,8 @@ def run_fine_grained_trial(
                         reason="retry_budget_exhausted",
                     )
                 )
-                components.planner.replan(task_text, state, stage, stage_reward)
+                if not request_replan(stage, stage_reward, result, turn=turn):
+                    break
                 current_stage = None
                 current_record = None
                 continue
@@ -600,7 +577,8 @@ def run_fine_grained_trial(
                         reason="restage_budget_exhausted",
                     )
                 )
-                components.planner.replan(task_text, state, stage, stage_reward)
+                if not request_replan(stage, stage_reward, result, turn=turn):
+                    break
                 current_stage = None
                 current_record = None
                 continue
@@ -631,7 +609,8 @@ def run_fine_grained_trial(
                     reason=stage_reward.code,
                 )
             )
-            components.planner.replan(task_text, state, stage, stage_reward)
+            if not request_replan(stage, stage_reward, result, turn=turn):
+                break
             current_stage = None
             current_record = None
         else:
@@ -696,6 +675,7 @@ class FineGrainedTrialExecutor(TrialExecutorBase):
         trial_config = FineGrainedTrialConfig(
             max_turns=int(self.config.get("max_turns", 50)),
             max_wall_time_s=self.config.get("max_wall_time_s"),
+            max_replans=int(self.config.get("max_replans", 2)),
         )
         return run_fine_grained_trial(
             context.env,
@@ -742,8 +722,10 @@ __all__ = [
     "FineGrainedTrialComponents",
     "FineGrainedTrialConfig",
     "FineGrainedTrialExecutor",
+    "FailureCode",
     "Observation",
     "RecoveryAction",
+    "RecoveryContext",
     "RecoveryDecision",
     "RecoveryPolicy",
     "RewardStatus",

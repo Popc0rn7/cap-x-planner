@@ -332,6 +332,25 @@ def test_retry_budget_exhaustion_fails_stage_and_replans() -> None:
     assert any(event["event"] == "retry_budget_exhausted" for event in _events(summary))
 
 
+def test_replan_budget_exhaustion_fails_current_stage_and_stops_trial() -> None:
+    env = FakeEnv()
+    planner = FakePlanner(Stage("grasp", "grasp cup", ToolCall(action="VLA")))
+    executor = SequenceExecutor(env, [(False, "controller_failed")])
+
+    summary = run_fine_grained_trial(
+        env,
+        1,
+        FineGrainedTrialComponents(
+            planner, executor, ResultVerifier(), RetryRecovery(), FakeMemory()
+        ),
+        config=FineGrainedTrialConfig(max_turns=5, max_replans=0),
+    )
+
+    assert planner.replans == 0
+    assert summary.stage_records[0]["status"] == "failed"
+    assert _events(summary)[-1]["stop_reason"] == "replan_budget_exhausted"
+
+
 class TwoRepairRestage:
     def decide(self, call, state, verdict, retry_count) -> RecoveryDecision:
         return RecoveryDecision(

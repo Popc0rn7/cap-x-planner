@@ -1,0 +1,61 @@
+# P0 agentic stage planning smoke test:
+# "pick up the alphabet soup and place it in the basket"
+#
+# Prerequisites: LIBERO + CUDA, the configured planner/reward model endpoint, and a
+# native VLA HTTP service on port 8123. See tests/integrations for the opt-in smoke test.
+
+env:
+  _target_: capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.libero.FrankaLiberoEnv
+      suite_name: libero_object
+      task_id: 0
+      privileged: false
+      max_steps: 8000
+      control_freq: 20
+    privileged: false
+    apis:
+      - FrankaLiberoApiReduced
+      - name: VlaPrimitiveApi
+        config:
+          model:
+            type: http
+            adapter:
+              name: native
+            transport:
+              base_url: http://127.0.0.1:8123
+              timeout: 120
+          action_adapter:
+            name: identity
+          primitive:
+            default_max_chunks: 2
+    prompt: "Goal: {libero_environment_goal}"
+
+trial_executor:
+  type: fine_grained
+  max_turns: 12
+  max_replans: 2
+  component_factory:
+    _target_: capx.workflows.fine_grained.build_fine_grained_components
+    planner_model_args:
+      _target_: capx.llm.client.ModelQueryArgs
+      model: openai/gpt-5
+      server_url: http://127.0.0.1:8110/chat/completions
+      temperature: 0.0
+      max_tokens: 4096
+    reward_model_args:
+      _target_: capx.llm.client.ModelQueryArgs
+      model: openai/gpt-5
+      server_url: http://127.0.0.1:8110/chat/completions
+      temperature: 0.0
+      max_tokens: 4096
+    budgets:
+      max_replans: 2
+
+record_video: true
+use_img_differencing: false
+output_dir: ./outputs/franka_libero_object_0_fine_grained
+trials: 1
+num_workers: 1

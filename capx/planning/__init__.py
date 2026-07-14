@@ -1,5 +1,30 @@
 """Stage planning and reward evaluation primitives."""
 
+from capx.planning.agentic_builder import (
+    AgenticStagePlanBuilder,
+    ModelStagePlanAgent,
+    PlannerStateView,
+    StagePlanAgent,
+    StagePlanBuildError,
+    StagePlanRequest,
+)
+from capx.planning.primitives import (
+    PrimitiveCatalog,
+    PrimitiveSpec,
+    ToolCall,
+    ToolResult,
+    WorldState,
+    libero_p0_primitive_catalog,
+)
+from capx.planning.recovery import (
+    FailureCode,
+    RecoveryAction,
+    RecoveryContext,
+    RecoveryDecision,
+    RecoveryPolicy,
+    RuleBasedRecoveryPolicy,
+    classify_failure,
+)
 from capx.planning.stage_planner import (
     Stage,
     StagePlan,
@@ -27,16 +52,30 @@ from capx.planning.stage_reward import (
 )
 
 __all__ = [
+    "AgenticStagePlanBuilder",
     "AgenticStageRewardVerifier",
+    "FailureCode",
     "ModelStageRewardCodeAgent",
+    "ModelStagePlanAgent",
+    "PlannerStateView",
+    "PrimitiveCatalog",
+    "PrimitiveSpec",
     "ReadOnlyStageRewardSandbox",
     "ReadOnlyVerificationTool",
+    "RecoveryAction",
+    "RecoveryContext",
+    "RecoveryDecision",
+    "RecoveryPolicy",
     "RewardCodeError",
     "RewardCodeTimeout",
     "RewardStatus",
+    "RuleBasedRecoveryPolicy",
     "Stage",
     "StagePlan",
+    "StagePlanAgent",
     "StagePlanBuilder",
+    "StagePlanBuildError",
+    "StagePlanRequest",
     "StagePlanner",
     "StageProgress",
     "StageReward",
@@ -45,7 +84,12 @@ __all__ = [
     "StageRewardRule",
     "StageStatus",
     "StaticStageRewardCodeAgent",
+    "ToolCall",
+    "ToolResult",
     "TurnContext",
     "TurnRole",
     "VerificationToolRegistry",
+    "WorldState",
+    "classify_failure",
+    "libero_p0_primitive_catalog",
 ]

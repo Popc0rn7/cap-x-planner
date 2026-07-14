@@ -7,11 +7,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from capx.envs.trial_fine_grained import (
-        ToolCall,
-        ToolResult,
-        WorldState,
-    )
+    from capx.planning.primitives import ToolCall, ToolResult, WorldState
     from capx.planning.stage_reward import StageReward
 
 
@@ -85,6 +81,7 @@ class StagePlanBuilder(Protocol):
         completed_stages: tuple[Stage, ...],
         failed_stage: Stage,
         reward: StageReward,
+        result: ToolResult | None = None,
     ) -> tuple[Stage, ...]: ...
 
 
@@ -160,11 +157,20 @@ class StagePlanner:
         state: WorldState,
         failed_stage: Stage,
         reward: StageReward,
+        result: ToolResult | None = None,
     ) -> None:
         self._require_current(failed_stage)
         assert self._plan is not None
         completed = self._plan.stages[: self._index]
-        replacement = tuple(self._builder.replan(task, state, completed, failed_stage, reward))
+        try:
+            replacement = tuple(
+                self._builder.replan(  # type: ignore[call-arg]
+                    task, state, completed, failed_stage, reward, result
+                )
+            )
+        except TypeError:
+            # Compatibility for external builders implementing the original P0 protocol.
+            replacement = tuple(self._builder.replan(task, state, completed, failed_stage, reward))
         new_plan = StagePlan(task=task, stages=completed + replacement)
         self._validate_plan(new_plan)
         self._plan = new_plan

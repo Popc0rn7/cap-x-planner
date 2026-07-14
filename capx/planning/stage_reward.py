@@ -14,7 +14,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from capx.envs.trial_fine_grained import ToolCall, ToolResult, WorldState
+    from capx.planning.primitives import ToolCall, ToolResult, WorldState
     from capx.planning.stage_planner import TurnContext
 
 

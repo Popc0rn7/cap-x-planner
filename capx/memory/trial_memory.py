@@ -23,13 +23,9 @@ from capx.memory.task_memory import (
 )
 
 if TYPE_CHECKING:
-    from capx.envs.trial_fine_grained import (
-        Observation,
-        RecoveryDecision,
-        ToolCall,
-        ToolResult,
-        WorldState,
-    )
+    from capx.envs.trial_fine_grained import Observation
+    from capx.planning.primitives import ToolCall, ToolResult, WorldState
+    from capx.planning.recovery import RecoveryDecision
     from capx.planning.stage_planner import TurnContext
     from capx.planning.stage_reward import StageReward
 
@@ -224,6 +220,7 @@ class HierarchicalTrialMemory:
             raise ValueError(f"Turn {context.turn_id} already has a recovery decision")
         attempt["recovery"] = {
             "action": decision.action.value,
+            "failure_code": decision.failure_code.value,
             "message": decision.message,
             "retry_failed_call": decision.retry_failed_call,
             "tool_calls": [self._call_dict(call) for call in decision.tool_calls],
