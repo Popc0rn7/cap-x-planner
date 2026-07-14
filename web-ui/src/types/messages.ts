@@ -103,6 +103,13 @@ export interface ExecutionStepEvent extends WSEventBase {
   highlight?: boolean;  // If true, display with highlighted color scheme
 }
 
+export interface TrialProgressEvent extends WSEventBase {
+  type: 'trial_progress';
+  event: string;
+  turn: number;
+  data: Record<string, unknown>;
+}
+
 export interface UserPromptRequestEvent extends WSEventBase {
   type: 'user_prompt_request';
   current_state_summary: string;
@@ -141,6 +148,7 @@ export type WSEvent =
   | CodeExecutionResultEvent
   | VisualFeedbackEvent
   | ExecutionStepEvent
+  | TrialProgressEvent
   | ImageAnalysisEvent
   | UserPromptRequestEvent
   | TrialCompleteEvent
@@ -220,6 +228,10 @@ export type ChatMessageType =
   | 'model_response'
   | 'code_execution'
   | 'execution_step'
+  | 'trial_progress'
+  | 'stage_plan'
+  | 'primitive_execution'
+  | 'memory'
   | 'visual_feedback'
   | 'image_analysis'
   | 'user_prompt'
@@ -256,6 +268,15 @@ export interface ChatMessage {
   analysisType?: 'initial_description' | 'state_comparison';  // for image_analysis messages
   modelUsed?: string;  // for image_analysis and model_streaming messages
   turnNumber?: number;  // for multi-turn tracking
+  progressEvent?: string;  // for stage/primitive trial progress
+  progressData?: Record<string, unknown>;
+  stageId?: string;
+  turnRole?: string;
+  primitiveAction?: string;
+  primitiveTarget?: unknown;
+  primitiveParams?: Record<string, unknown>;
+  primitiveResult?: Record<string, unknown>;
+  memorySnapshot?: Record<string, unknown>;
   isStreaming?: boolean;
   thinkingPhase?: ThinkingPhase;
   initStatus?: string;  // for environment_init messages

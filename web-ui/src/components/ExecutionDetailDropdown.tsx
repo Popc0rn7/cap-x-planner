@@ -7,6 +7,7 @@ interface ExecutionDetailDropdownProps {
   steps: ExecutionStepData[];
   blockIndex: number;
   isExecuting?: boolean;
+  itemLabel?: string;
 }
 
 function ImageGrid({ images, maxVisible = 4 }: { images: string[]; maxVisible?: number }) {
@@ -86,7 +87,12 @@ function ExecutionStep({ step }: { step: ExecutionStepData }) {
   );
 }
 
-export function ExecutionDetailDropdown({ steps, blockIndex, isExecuting }: ExecutionDetailDropdownProps) {
+export function ExecutionDetailDropdown({
+  steps,
+  blockIndex,
+  isExecuting,
+  itemLabel = 'Block',
+}: ExecutionDetailDropdownProps) {
   const [expanded, setExpanded] = useState(true);
 
   if (steps.length === 0) return null;
@@ -114,7 +120,7 @@ export function ExecutionDetailDropdown({ steps, blockIndex, isExecuting }: Exec
             </svg>
           )}
         </div>
-        <span className="text-xs text-text-tertiary">Block {blockIndex + 1}</span>
+        <span className="text-xs text-text-tertiary">{itemLabel} {blockIndex + 1}</span>
       </button>
 
       {expanded && (

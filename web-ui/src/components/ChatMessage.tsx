@@ -178,6 +178,166 @@ export function ChatMessageComponent({ message }: ChatMessageComponentProps) {
     case 'environment_init':
       return <EnvironmentInitMessage message={message} timestamp={timestamp} />;
 
+    case 'stage_plan': {
+      const data = message.progressData || {};
+      const stages = Array.isArray(data.stages) ? data.stages as Record<string, unknown>[] : [];
+      return (
+        <div className="flex items-start gap-3 p-4 bg-blue-950/20 border border-blue-800/30 border-l-2 border-l-blue-400 rounded-lg msg-enter">
+          <div className="flex-shrink-0 w-8 h-8 rounded-lg bg-blue-500/10 flex items-center justify-center text-blue-400 font-display font-bold text-sm">
+            S
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap mb-1">
+              <span className="text-xs font-display uppercase tracking-wider text-blue-400">
+                {message.progressEvent === 'plan_replanned' ? 'Replanned stages' : 'Stage plan'}
+              </span>
+              <span className="text-xs text-text-muted">{timestamp}</span>
+            </div>
+            <div className="text-sm text-text-primary font-medium mb-2">{message.content}</div>
+            <div className="space-y-2">
+              {stages.map((stage, index) => {
+                const primitive = stage.primitive as Record<string, unknown> | undefined;
+                return (
+                  <div key={`${String(stage.stage_id)}-${index}`} className="p-2.5 bg-surface-sunken/70 border border-surface-border rounded">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs font-mono text-blue-400">{String(stage.stage_id ?? index + 1)}</span>
+                      <span className="text-sm text-text-primary">{String(stage.objective ?? '')}</span>
+                    </div>
+                    <div className="mt-1 text-xs text-text-secondary font-mono">
+                      {String(primitive?.action ?? '')} {String(primitive?.target ?? '')}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    case 'primitive_execution': {
+      const steps = message.executionSteps || [];
+      const target = message.primitiveTarget == null
+        ? ''
+        : typeof message.primitiveTarget === 'string'
+        ? message.primitiveTarget
+        : JSON.stringify(message.primitiveTarget);
+      return (
+        <div className={`flex items-start gap-3 p-3 border-l-2 rounded-r-lg msg-enter ${
+          message.isExecuting ? 'border-l-accent bg-surface-raised/60' :
+          message.success ? 'border-l-nv-green bg-nv-green/5' : 'border-l-red-500 bg-red-950/20'
+        }`}>
+          <div className="flex-shrink-0 w-8 h-8 rounded-lg bg-surface-sunken flex items-center justify-center">
+            {message.isExecuting ? (
+              <span className="w-3 h-3 border-2 border-accent/30 border-t-accent rounded-full animate-spin" />
+            ) : (
+              <span className={`w-2 h-2 rounded-full ${message.success ? 'bg-nv-green' : 'bg-red-400'}`} />
+            )}
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap mb-1.5">
+              <span className="font-mono text-sm font-bold text-accent">{message.primitiveAction}</span>
+              {target && <span className="text-sm text-text-primary break-all">{target}</span>}
+              <span className="px-1.5 py-0.5 rounded bg-surface-overlay text-xs text-text-secondary">{message.turnRole}</span>
+              <span className="text-xs text-text-muted">turn {(message.turnNumber ?? 0) + 1}</span>
+              <span className="text-xs text-text-muted">stage {message.stageId}</span>
+            </div>
+            {message.primitiveParams && Object.keys(message.primitiveParams).length > 0 && (
+              <pre className="mb-2 p-2 text-xs font-mono text-text-secondary bg-surface-sunken border border-surface-border rounded overflow-x-auto">
+                {JSON.stringify(message.primitiveParams, null, 2)}
+              </pre>
+            )}
+            {message.isExecuting && steps.length === 0 && (
+              <div className="text-sm text-text-tertiary italic">Executing primitive...</div>
+            )}
+            {steps.length > 0 && (
+              <ExecutionDetailDropdown
+                steps={steps}
+                blockIndex={message.turnNumber ?? 0}
+                isExecuting={message.isExecuting}
+                itemLabel="Turn"
+              />
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    case 'memory': {
+      const initialized = message.progressEvent === 'memory_initialized';
+      const memory = message.memorySnapshot || {};
+      const taskMemory = memory.task_memory ? 'loaded' : 'empty';
+      const failures = Array.isArray(memory.failure_history) ? memory.failure_history.length : 0;
+      return (
+        <div className="p-4 bg-purple-950/15 border border-purple-800/25 border-l-2 border-l-purple-400 rounded-lg msg-enter">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs font-display uppercase tracking-wider text-purple-400">
+              {initialized ? 'Memory initialized' : 'Memory finalized'}
+            </span>
+            <span className="text-xs text-text-muted">{timestamp}</span>
+            <span className="text-xs text-text-tertiary">task memory: {taskMemory}</span>
+            <span className="text-xs text-text-tertiary">failures: {failures}</span>
+          </div>
+          <details className="mt-2 group">
+            <summary className="text-xs text-text-secondary cursor-pointer hover:text-text-primary">View memory snapshot</summary>
+            <pre className="mt-2 max-h-72 overflow-auto p-3 text-xs font-mono whitespace-pre-wrap text-text-secondary bg-surface-sunken border border-surface-border rounded">
+              {JSON.stringify(memory, null, 2)}
+            </pre>
+          </details>
+        </div>
+      );
+    }
+
+    case 'trial_progress': {
+      const event = message.progressEvent || 'progress';
+      const data = message.progressData || {};
+      const value = (key: string) => data[key] == null ? '' : String(data[key]);
+      const titles: Record<string, string> = {
+        stage_started: `Stage ${value('stage_id')} · ${value('objective')}`,
+        tool_call: `${value('turn_role') || 'primary'} · ${value('action')} ${value('target')}`,
+        stage_reward: `Reward ${value('reward')} · ${value('status')}`,
+        recovery: `Recovery · ${value('action')}`,
+        stage_completed: `Stage ${value('stage_id')} completed`,
+        stage_failed: `Stage ${value('stage_id')} failed`,
+        stage_aborted: `Stage ${value('stage_id')} aborted`,
+        trial_finished: `Trial finished · ${value('stop_reason')}`,
+      };
+      const title = titles[event] || event.replaceAll('_', ' ');
+      const detail = event === 'stage_reward'
+        ? value('reward_code') || value('tool_code')
+        : event === 'recovery'
+        ? value('message') || value('failure_code')
+        : event.startsWith('stage_')
+        ? value('reason')
+        : '';
+      const positive = event === 'stage_completed' ||
+        (event === 'stage_reward' && value('status').toLowerCase() === 'success') ||
+        (event === 'trial_finished' && value('task_completed') === 'true');
+      const negative = event.includes('failed') || event.includes('aborted') ||
+        event.includes('exhausted') ||
+        (event === 'stage_reward' && ['failure', 'unsafe'].includes(value('status').toLowerCase()));
+
+      return (
+        <div className={`flex items-start gap-3 py-2 px-3 rounded-md border-l-2 msg-enter ${
+          positive ? 'bg-nv-green/5 border-l-nv-green' :
+          negative ? 'bg-red-950/20 border-l-red-500' :
+          'bg-surface-raised/60 border-l-accent/50'
+        }`}>
+          <div className={`mt-1.5 w-2 h-2 rounded-full flex-shrink-0 ${
+            positive ? 'bg-nv-green' : negative ? 'bg-red-400' : 'bg-accent'
+          }`} />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-sm text-text-primary font-display font-medium capitalize">{title}</span>
+              <span className="text-xs text-text-muted">turn {message.turnNumber ?? 0}</span>
+              <span className="text-xs text-text-muted">{timestamp}</span>
+            </div>
+            {detail && <div className="mt-1 text-xs text-text-secondary break-words">{detail}</div>}
+          </div>
+        </div>
+      );
+    }
+
     case 'model_thinking':
       return (
         <div className="flex items-center gap-3 py-1.5 msg-enter">

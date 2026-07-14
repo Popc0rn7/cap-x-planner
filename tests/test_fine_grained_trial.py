@@ -131,6 +131,7 @@ def test_fine_grained_trial_observes_and_verifies_after_one_tool_call() -> None:
     planner = FakePlanner(Stage("grasp", "grasp cup", call))
     memory = FakeMemory()
     executor = CompletingExecutor(env)
+    streamed_events: list[dict[str, Any]] = []
 
     summary = run_fine_grained_trial(
         env,
@@ -142,6 +143,7 @@ def test_fine_grained_trial_observes_and_verifies_after_one_tool_call() -> None:
             recovery_policy=AbortRecovery(),
             memory=memory,
         ),
+        event_sink=streamed_events.append,
     )
 
     assert summary.success is True
@@ -156,12 +158,17 @@ def test_fine_grained_trial_observes_and_verifies_after_one_tool_call() -> None:
     assert summary.num_stages_completed == 1
     assert summary.stage_records[0]["status"] == "success"
     assert [event["event"] for event in _events(summary)] == [
+        "memory_initialized",
+        "plan_created",
         "stage_started",
         "tool_call",
+        "primitive_result",
         "stage_reward",
         "stage_completed",
+        "memory_finalized",
         "trial_finished",
     ]
+    assert streamed_events == _events(summary)
 
 
 class RestagingExecutor:

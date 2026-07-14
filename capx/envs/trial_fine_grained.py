@@ -17,7 +17,7 @@ import time
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from capx.envs.configs.instantiate import instantiate, locate
 from capx.envs.trial_base import TrialContext, TrialExecutorBase
@@ -40,6 +40,7 @@ from capx.planning.stage_reward import (
 from capx.utils.launch_utils import TrialSummary
 
 Observation = dict[str, Any]
+FineGrainedEventSink = Callable[[dict[str, Any]], None]
 
 
 # Temporary import aliases for integrations written against the P0 verifier API.
@@ -194,6 +195,71 @@ def _trace_line(turn: int, event: str, **fields: Any) -> str:
     return json.dumps(payload, default=repr, sort_keys=True)
 
 
+def _memory_view(state: Mapping[str, Any], *, include_shared: bool = False) -> dict[str, Any]:
+    """Build a compact, non-privileged view of the memory state for trace consumers."""
+    keys = (
+        "observation_id",
+        "robot",
+        "objects",
+        "holding",
+        "current_stage",
+        "last_outcome",
+        "failure_history",
+        "budgets",
+    )
+    view = {key: state.get(key) for key in keys if key in state}
+    if include_shared:
+        view["task_memory"] = state.get("task_memory")
+        view["global_memory"] = state.get("global_memory")
+    return view
+
+
+def _current_memory_state(memory: TrialMemory, fallback: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Read a public memory snapshot when available, retaining protocol compatibility."""
+    try:
+        current = getattr(memory, "state")
+    except (AttributeError, RuntimeError):
+        return fallback
+    return current if isinstance(current, Mapping) else fallback
+
+
+def _stage_plan_view(planner: FineGrainedPlanner) -> list[dict[str, Any]]:
+    """Return the public stage plan exposed by the production planner, when available."""
+    try:
+        stages = getattr(planner, "plan").stages
+    except (AttributeError, RuntimeError):
+        return []
+    return [
+        {
+            "stage_id": stage.id,
+            "objective": stage.objective,
+            "primitive": {
+                "action": stage.primary_call.action,
+                "target": stage.primary_call.target,
+                "params": stage.primary_call.params,
+            },
+            "retry_budget": stage.retry_budget,
+            "restage_budget": stage.restage_budget,
+        }
+        for stage in stages
+    ]
+
+
+class _TraceLog(list[str]):
+    """Trace list that can mirror JSON-safe events to an interactive observer."""
+
+    def __init__(self, event_sink: FineGrainedEventSink | None = None) -> None:
+        super().__init__()
+        self._event_sink = event_sink
+
+    def append(self, line: str) -> None:
+        super().append(line)
+        if self._event_sink is not None:
+            # Lines are normalized through ``_trace_line`` first, so UI consumers never
+            # need to serialize simulator/model objects themselves.
+            self._event_sink(json.loads(line))
+
+
 def run_fine_grained_trial(
     env: Any,
     trial: int,
@@ -201,6 +267,7 @@ def run_fine_grained_trial(
     *,
     task: str | None = None,
     config: FineGrainedTrialConfig | None = None,
+    event_sink: FineGrainedEventSink | None = None,
 ) -> TrialSummary:
     """Run one task attempt with exactly one primitive per execution turn.
 
@@ -211,7 +278,7 @@ def run_fine_grained_trial(
 
     trial_config = config or FineGrainedTrialConfig()
     started_at = time.monotonic()
-    trace: list[str] = []
+    trace: list[str] = _TraceLog(event_sink)
     pending_calls: deque[_ScheduledCall] = deque()
     current_stage: Stage | None = None
     current_record: dict[str, Any] | None = None
@@ -231,7 +298,22 @@ def run_fine_grained_trial(
         raise ValueError("A non-empty task must be provided to run_fine_grained_trial")
 
     state = components.memory.bootstrap(task_text, observation)
+    trace.append(
+        _trace_line(
+            0,
+            "memory_initialized",
+            memory=_memory_view(state, include_shared=True),
+        )
+    )
     components.planner.initialize(task_text, state)
+    trace.append(
+        _trace_line(
+            0,
+            "plan_created",
+            task=task_text,
+            stages=_stage_plan_view(components.planner),
+        )
+    )
 
     def request_replan(
         stage: Stage,
@@ -259,6 +341,15 @@ def run_fine_grained_trial(
             # Compatibility for configured planners implementing the original P0 protocol.
             components.planner.replan(task_text, state, stage, reward)
         replans_used += 1
+        trace.append(
+            _trace_line(
+                turn,
+                "plan_replanned",
+                failed_stage_id=stage.id,
+                replans_used=replans_used,
+                stages=_stage_plan_view(components.planner),
+            )
+        )
         return True
 
     for turn in range(trial_config.max_turns):
@@ -353,6 +444,21 @@ def run_fine_grained_trial(
         # A failed primitive can still move the robot or scene. Always observe and update first.
         observation = _observe(env)
         state = components.memory.update_after_execution(context, call, result, observation)
+        trace.append(
+            _trace_line(
+                turn,
+                "primitive_result",
+                stage_id=stage.id,
+                turn_role=scheduled.role.value,
+                call_id=call.id,
+                ok=result.ok,
+                code=result.code,
+                message=result.message,
+                updated_state=result.updated_state,
+                telemetry=result.telemetry,
+                memory=_memory_view(state),
+            )
+        )
         reward_context = StageRewardContext(
             turn=context,
             call=call,
@@ -383,6 +489,7 @@ def run_fine_grained_trial(
                 reward_code=stage_reward.code,
                 evidence=stage_reward.evidence,
                 tool_trace=stage_reward.tool_trace,
+                memory=_memory_view(_current_memory_state(components.memory, state)),
             )
         )
 
@@ -635,6 +742,15 @@ def run_fine_grained_trial(
     if task_completed:
         stop_reason = "task_completed"
     components.memory.finalize(task_completed)
+    final_memory_state = _current_memory_state(components.memory, state)
+    trace.append(
+        _trace_line(
+            turns_executed,
+            "memory_finalized",
+            success=task_completed,
+            memory=_memory_view(final_memory_state, include_shared=True),
+        )
+    )
     trace.append(
         _trace_line(
             turns_executed,
@@ -683,6 +799,7 @@ class FineGrainedTrialExecutor(TrialExecutorBase):
             components,
             task=self.config.get("task"),
             config=trial_config,
+            event_sink=context.partial_artifacts.get("event_sink"),
         )
 
     def _build_components(self, env: Any) -> FineGrainedTrialComponents:
@@ -722,6 +839,7 @@ __all__ = [
     "FineGrainedTrialComponents",
     "FineGrainedTrialConfig",
     "FineGrainedTrialExecutor",
+    "FineGrainedEventSink",
     "FailureCode",
     "Observation",
     "RecoveryAction",

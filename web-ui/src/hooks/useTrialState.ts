@@ -284,6 +284,115 @@ export function useTrialState(): UseTrialStateReturn {
           });
           break;
 
+        case 'trial_progress':
+          if (event.event === 'memory_initialized' || event.event === 'memory_finalized') {
+            addMessage({
+              type: 'memory',
+              timestamp: event.timestamp,
+              turnNumber: event.turn,
+              progressEvent: event.event,
+              memorySnapshot: event.data.memory as Record<string, unknown> | undefined,
+              success: event.data.success as boolean | undefined,
+            });
+          } else if (event.event === 'plan_created' || event.event === 'plan_replanned') {
+            addMessage({
+              type: 'stage_plan',
+              timestamp: event.timestamp,
+              turnNumber: event.turn,
+              content: event.event === 'plan_created' ? 'Initial stage plan' : 'Replanned stages',
+              progressEvent: event.event,
+              progressData: event.data,
+            });
+          } else if (event.event === 'tool_call') {
+            addMessage({
+              type: 'primitive_execution',
+              timestamp: event.timestamp,
+              turnNumber: event.turn,
+              stageId: String(event.data.stage_id ?? ''),
+              turnRole: String(event.data.turn_role ?? 'primary'),
+              primitiveAction: String(event.data.action ?? ''),
+              primitiveTarget: event.data.target,
+              primitiveParams: event.data.params as Record<string, unknown> | undefined,
+              isExecuting: true,
+              executionSteps: [],
+            });
+          } else if (event.event === 'primitive_result') {
+            setTrialState((prev) => ({
+              ...prev,
+              messages: prev.messages.map((message) =>
+                message.type === 'primitive_execution' && message.turnNumber === event.turn
+                  ? {
+                      ...message,
+                      primitiveResult: event.data,
+                      memorySnapshot: event.data.memory as Record<string, unknown> | undefined,
+                      executionSteps: [
+                        ...(message.executionSteps || []),
+                        {
+                          toolName: 'Primitive Result',
+                          text: `**${event.data.ok ? 'Success' : 'Failed'}** · ${String(event.data.code ?? '')}${event.data.message ? `\n\n${String(event.data.message)}` : ''}`,
+                          images: [],
+                          stepIndex: message.executionSteps?.length || 0,
+                        },
+                      ],
+                    }
+                  : message
+              ),
+            }));
+          } else if (event.event === 'stage_reward' || event.event === 'recovery') {
+            setTrialState((prev) => ({
+              ...prev,
+              messages: prev.messages.map((message) => {
+                if (message.type !== 'primitive_execution' || message.turnNumber !== event.turn) {
+                  return message;
+                }
+                const steps = message.executionSteps || [];
+                const isReward = event.event === 'stage_reward';
+                const rewardSuccess = String(event.data.status ?? '').toLowerCase() === 'success';
+                const { memory, ...eventDetails } = event.data;
+                const newSteps = [
+                  {
+                    toolName: isReward ? 'Stage Reward' : 'Recovery',
+                    text: `\`\`\`json\n${JSON.stringify(eventDetails, null, 2)}\n\`\`\``,
+                    images: [],
+                    stepIndex: steps.length,
+                    highlight: !isReward || !rewardSuccess,
+                  },
+                ];
+                if (isReward && memory) {
+                  newSteps.push({
+                    toolName: 'Trial Memory',
+                    text: `\`\`\`json\n${JSON.stringify(memory, null, 2)}\n\`\`\``,
+                    images: [],
+                    stepIndex: steps.length + 1,
+                    highlight: false,
+                  });
+                }
+                return {
+                  ...message,
+                  isExecuting: isReward ? false : message.isExecuting,
+                  success: isReward ? rewardSuccess : message.success,
+                  reward: isReward ? Number(event.data.reward ?? 0) : message.reward,
+                  memorySnapshot: isReward
+                    ? event.data.memory as Record<string, unknown> | undefined
+                    : message.memorySnapshot,
+                  executionSteps: [
+                    ...steps,
+                    ...newSteps,
+                  ],
+                };
+              }),
+            }));
+          } else {
+            addMessage({
+              type: 'trial_progress',
+              timestamp: event.timestamp,
+              turnNumber: event.turn,
+              progressEvent: event.event,
+              progressData: event.data,
+            });
+          }
+          break;
+
         case 'code_execution_result':
           // Update the last code execution message
           setTrialState((prev) => {

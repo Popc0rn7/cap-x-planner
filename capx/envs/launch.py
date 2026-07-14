@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -184,29 +183,8 @@ def _ensure_frontend_built() -> None:
     print("[web-ui] Frontend build complete")
 
 
-def _validate_web_ui_trial_executor(config: dict[str, Any]) -> None:
-    """Reject trial algorithms that the independent async Web UI loop cannot run."""
-    # TODO
-    trial_spec = config.get("trial_executor")
-    if trial_spec is None:
-        trial_type = "code_agent"
-    elif isinstance(trial_spec, str):
-        trial_type = trial_spec.strip().lower()
-    elif isinstance(trial_spec, Mapping):
-        trial_type = str(trial_spec.get("type", "code_agent")).strip().lower()
-    else:
-        raise TypeError("trial_executor must be a name or mapping")
-    if trial_type != "code_agent":
-        raise ValueError(
-            "The Web UI currently supports only trial_executor.type=code_agent; "
-            "use headless mode for fine_grained trials"
-        )
-
-
 def _run_web_ui(args: LaunchArgs, config: dict[str, Any]) -> None:
     """Start the interactive web UI server."""
-    _validate_web_ui_trial_executor(config)
-
     import uvicorn
     from capx.web.server import create_app
 
@@ -228,8 +206,6 @@ def main(args: LaunchArgs) -> None:
 
     start_time = time.time()
     env_factory, config, api_servers = _load_config(args)
-    if config.get("web_ui", False):
-        _validate_web_ui_trial_executor(config)
     server_procs = _start_api_servers(api_servers)
 
     try:

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from capx.envs.configs.instantiate import instantiate
+from capx.envs.trial_base import TrialContext
+from capx.envs.trial_factory import build_trial_executor
 from capx.llm.client import (
     VLM_MODELS,
     ModelQueryArgs,
@@ -45,6 +47,7 @@ from capx.web.models import (
     StateUpdateEvent,
     ThinkingPhase,
     TrialCompleteEvent,
+    TrialProgressEvent,
     UserPromptRequestEvent,
     VisualFeedbackEvent,
     WSEventBase,
@@ -55,6 +58,167 @@ from capx.web.session_manager import Session, run_blocking_with_interrupt
 logger = logging.getLogger(__name__)
 
 MULTITURN_LIMIT = 30
+
+
+def _trial_executor_type(config: dict[str, Any]) -> str:
+    """Return the normalized executor name used by the loaded experiment config."""
+    spec = config.get("trial_executor")
+    if spec is None:
+        return "code_agent"
+    if isinstance(spec, str):
+        return spec.strip().lower()
+    if isinstance(spec, dict):
+        return str(spec.get("type", "code_agent")).strip().lower()
+    raise TypeError("trial_executor must be a name or mapping")
+
+
+async def _run_structured_trial_async(
+    session: Session,
+    args: LaunchArgsCompat,
+) -> TrialSummary | None:
+    """Run a structured executor while adapting its trace to WebSocket events."""
+    import concurrent.futures
+
+    async def emit(event: WSEventBase) -> None:
+        await session.emit(event)
+
+    env_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="structured-trial-env",
+    )
+    loop = asyncio.get_running_loop()
+    env = None
+    try:
+        for _ in range(50):
+            if session.websockets:
+                break
+            await asyncio.sleep(0.1)
+
+        session.state = SessionState.RUNNING
+        await emit(StateUpdateEvent(session_id=session.session_id, state=SessionState.RUNNING))
+        await emit(
+            EnvironmentInitEvent(
+                session_id=session.session_id,
+                status="starting",
+                message="Initializing structured trial environment...",
+            )
+        )
+
+        if session.env_factory is None:
+            raise RuntimeError("Session has no environment factory")
+        if "cfg" in session.env_factory:
+            session.env_factory["cfg"]["enable_render"] = True
+            session.env_factory["cfg"]["viser_debug"] = True
+
+        env = await loop.run_in_executor(env_executor, instantiate, session.env_factory)
+        session.env = env
+        if hasattr(env, "_apis"):
+            for api in env._apis.values():
+                api.enable_webui(True)
+
+        if session.config.get("record_video") and hasattr(env, "enable_video_capture"):
+            env.enable_video_capture(True, clear=True)
+
+        task_prompt = session.env_factory.get("cfg", {}).get("prompt")
+        await emit(
+            EnvironmentInitEvent(
+                session_id=session.session_id,
+                status="complete",
+                message="Environment ready; planning stages...",
+                description_content=task_prompt,
+            )
+        )
+
+        progress_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        def event_sink(payload: dict[str, Any]) -> None:
+            loop.call_soon_threadsafe(progress_queue.put_nowait, payload)
+
+        executor = build_trial_executor(session.config.get("trial_executor"))
+        context = TrialContext(
+            env=env,
+            trial=1,
+            args=args,
+            runtime_config=session.config,
+            multi_turn_prompt=session.env_factory.get("cfg", {}).get("multi_turn_prompt"),
+            partial_artifacts={"event_sink": event_sink},
+        )
+
+        def run_executor() -> TrialSummary:
+            session.execution_thread_id = threading.get_ident()
+            try:
+                return executor.run(context)
+            finally:
+                session.execution_thread_id = None
+
+        run_future = loop.run_in_executor(env_executor, run_executor)
+        while not run_future.done():
+            try:
+                payload = await asyncio.wait_for(progress_queue.get(), timeout=0.2)
+            except asyncio.TimeoutError:
+                continue
+            event_name = str(payload.pop("event"))
+            turn = int(payload.pop("turn"))
+            session.current_block_index = turn
+            session.total_code_blocks = max(session.total_code_blocks, turn + 1)
+            await emit(
+                TrialProgressEvent(
+                    session_id=session.session_id,
+                    event=event_name,
+                    turn=turn,
+                    data=payload,
+                )
+            )
+
+        summary = await run_future
+        while not progress_queue.empty():
+            payload = progress_queue.get_nowait()
+            event_name = str(payload.pop("event"))
+            turn = int(payload.pop("turn"))
+            await emit(
+                TrialProgressEvent(
+                    session_id=session.session_id,
+                    event=event_name,
+                    turn=turn,
+                    data=payload,
+                )
+            )
+
+        session.total_code_blocks = summary.num_code_blocks
+        session.state = SessionState.COMPLETE
+        await emit(
+            TrialCompleteEvent(
+                session_id=session.session_id,
+                success=summary.success,
+                total_reward=summary.reward,
+                task_completed=summary.task_completed,
+                num_regenerations=summary.num_regenerations,
+                num_code_blocks=summary.num_code_blocks,
+                summary=summary.log,
+            )
+        )
+        await emit(StateUpdateEvent(session_id=session.session_id, state=SessionState.COMPLETE))
+        gc.collect()
+        return summary
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logger.info("Structured trial interrupted")
+        session.state = SessionState.IDLE
+        await emit(StateUpdateEvent(session_id=session.session_id, state=SessionState.IDLE))
+        return None
+    except Exception as exc:
+        logger.exception("Structured trial error: %s", exc)
+        session.state = SessionState.ERROR
+        await emit(
+            ErrorEvent(
+                session_id=session.session_id,
+                message=str(exc) or type(exc).__name__,
+                recoverable=True,
+            )
+        )
+        await emit(StateUpdateEvent(session_id=session.session_id, state=SessionState.ERROR))
+        return None
+    finally:
+        env_executor.shutdown(wait=False, cancel_futures=True)
 
 
 @dataclass
@@ -89,6 +253,9 @@ async def run_trial_async(
     Returns:
         TrialSummary on completion, None if cancelled.
     """
+    if _trial_executor_type(session.config) != "code_agent":
+        return await _run_structured_trial_async(session, args)
+
     trial_start_time = time.time()
     trial = 1  # Interactive mode runs one trial at a time
 

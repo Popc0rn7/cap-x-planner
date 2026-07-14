@@ -142,6 +142,15 @@ class ExecutionStepEvent(WSEventBase):
     highlight: bool = False  # If True, display with highlighted color scheme
 
 
+class TrialProgressEvent(WSEventBase):
+    """Structured progress emitted by stage/primitive-based trial executors."""
+
+    type: str = "trial_progress"
+    event: str
+    turn: int
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class VisualFeedbackEvent(WSEventBase):
     """Emitted when visual feedback is captured."""
 
