@@ -1,8 +1,8 @@
 """Primitive-level trial loop for closed-loop agentic planning.
 
-Unlike :mod:`capx.envs.trial`, this module never executes a generated Python program. Each
-turn executes exactly one structured tool call, refreshes the observation, verifies the
-post-condition, and then asks a recovery policy whether to retry, re-stage, replan, or stop.
+Unlike :mod:`capx.envs.trial`, this module executes exactly one physical primitive per turn.
+It refreshes the observation, computes an evidence-backed Stage reward, and then asks a
+recovery policy whether to retry, re-stage, replan, or stop.
 
 The planner and execution services are injected through protocols so this loop can be tested
 without a simulator or model server and connected to either a coding-agent or model-backed
@@ -11,6 +11,7 @@ planner later.
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 import uuid
@@ -21,21 +22,18 @@ from enum import StrEnum
 from typing import Any, Protocol
 
 from capx.envs.configs.instantiate import instantiate, locate
-from capx.envs.stage_planner import Stage, TurnContext, TurnRole
 from capx.envs.trial_base import TrialContext, TrialExecutorBase
+from capx.planning.stage_planner import Stage, TurnContext, TurnRole
+from capx.planning.stage_reward import (
+    RewardStatus,
+    StageReward,
+    StageRewardContext,
+    StageRewardRule,
+)
 from capx.utils.launch_utils import TrialSummary
 
 WorldState = dict[str, Any]
 Observation = dict[str, Any]
-
-
-class VerdictStatus(StrEnum):
-    """Result of checking one primitive's post-condition."""
-
-    SUCCESS = "success"
-    FAILURE = "failure"
-    UNKNOWN = "unknown"
-    UNSAFE = "unsafe"
 
 
 class RecoveryAction(StrEnum):
@@ -54,15 +52,33 @@ class ToolCall:
     action: str
     target: Any | None = None
     params: dict[str, Any] = field(default_factory=dict)
+    reward_rules: tuple[StageRewardRule, ...] = ()
+    # Deprecated constructor compatibility. New code should use reward_rules.
     postconditions: tuple[dict[str, Any], ...] = ()
     timeout_s: float = 10.0
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "reward_rules", tuple(self.reward_rules))
+        object.__setattr__(self, "postconditions", tuple(self.postconditions))
         if not self.action.strip():
             raise ValueError("ToolCall.action must be non-empty")
         if self.timeout_s <= 0:
             raise ValueError("ToolCall.timeout_s must be positive")
+        if self.reward_rules and self.postconditions:
+            raise ValueError("ToolCall cannot define both reward_rules and postconditions")
+        if self.postconditions:
+            object.__setattr__(
+                self,
+                "reward_rules",
+                tuple(StageRewardRule.from_legacy(item) for item in self.postconditions),
+            )
+            object.__setattr__(self, "postconditions", ())
+        if any(not isinstance(rule, StageRewardRule) for rule in self.reward_rules):
+            raise TypeError("ToolCall.reward_rules entries must be StageRewardRule instances")
+        predicates = [rule.predicate for rule in self.reward_rules]
+        if len(predicates) != len(set(predicates)):
+            raise ValueError("ToolCall reward rule predicates must be unique")
 
 
 @dataclass(frozen=True)
@@ -76,14 +92,9 @@ class ToolResult:
     telemetry: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class VerificationVerdict:
-    """Evidence-backed interpretation of a tool result and refreshed state."""
-
-    status: VerdictStatus
-    code: str
-    message: str = ""
-    evidence: dict[str, Any] = field(default_factory=dict)
+# Temporary import aliases for integrations written against the P0 verifier API.
+VerdictStatus = RewardStatus
+VerificationVerdict = StageReward
 
 
 @dataclass(frozen=True)
@@ -128,7 +139,7 @@ class FineGrainedPlanner(Protocol):
         stage: Stage,
         role: TurnRole,
         result: ToolResult,
-        verdict: VerificationVerdict,
+        reward: StageReward,
     ) -> None:
         """Update stage state after any primary or repair attempt."""
 
@@ -137,7 +148,7 @@ class FineGrainedPlanner(Protocol):
         task: str,
         state: WorldState,
         failed_stage: Stage,
-        verdict: VerificationVerdict,
+        reward: StageReward,
     ) -> None:
         """Replace or revise the remaining stage plan."""
 
@@ -149,16 +160,15 @@ class ToolExecutor(Protocol):
         """Run a call until its internal stop condition or timeout."""
 
 
-class Verifier(Protocol):
-    """Check a primitive after the observation has been refreshed."""
+class StageRewardVerifier(Protocol):
+    """Compute a binary reward after the observation has been refreshed."""
 
-    def check(
-        self,
-        call: ToolCall,
-        state: WorldState,
-        result: ToolResult,
-    ) -> VerificationVerdict:
-        """Return an evidence-backed post-condition verdict."""
+    def compute_reward(self, context: StageRewardContext) -> StageReward:
+        """Return an evidence-backed Stage reward."""
+
+
+# Deprecated protocol name retained for configured integrations.
+Verifier = StageRewardVerifier
 
 
 class RecoveryPolicy(Protocol):
@@ -168,7 +178,7 @@ class RecoveryPolicy(Protocol):
         self,
         call: ToolCall,
         state: WorldState,
-        verdict: VerificationVerdict,
+        reward: StageReward,
         retry_count: int,
     ) -> RecoveryDecision:
         """Choose the next control-flow action."""
@@ -189,15 +199,26 @@ class TrialMemory(Protocol):
     ) -> WorldState:
         """Refresh state after every physical attempt, including failed attempts."""
 
-    def record_verdict(
+    def record_stage_reward(
         self,
         context: TurnContext,
         call: ToolCall,
         result: ToolResult,
-        verdict: VerificationVerdict,
+        reward: StageReward,
         state: WorldState,
     ) -> None:
-        """Append the verified attempt to episode memory."""
+        """Append the rewarded attempt to Trial Memory."""
+
+    def record_recovery(
+        self,
+        context: TurnContext,
+        decision: RecoveryDecision,
+        state: WorldState,
+    ) -> None:
+        """Attach the recovery decision to the verified attempt."""
+
+    def finalize(self, success: bool) -> Any:
+        """Freeze the Trial Memory and optionally promote it to Task Memory."""
 
 
 @dataclass(frozen=True)
@@ -206,7 +227,7 @@ class FineGrainedTrialComponents:
 
     planner: FineGrainedPlanner
     tool_executor: ToolExecutor
-    verifier: Verifier
+    verifier: StageRewardVerifier
     recovery_policy: RecoveryPolicy
     memory: TrialMemory
 
@@ -317,6 +338,10 @@ def run_fine_grained_trial(
                     "retries_used": 0,
                     "restages_used": 0,
                     "turns": 0,
+                    "reward": None,
+                    "reward_valid": None,
+                    "reward_status": None,
+                    "reward_code": None,
                 }
                 stage_records.append(current_record)
                 trace.append(
@@ -358,6 +383,7 @@ def run_fine_grained_trial(
             )
         )
 
+        state_before = copy.deepcopy(state)
         try:
             result = components.tool_executor.execute(call, state)
         except Exception as exc:  # Normalize tool boundary failures for recovery.
@@ -371,20 +397,36 @@ def run_fine_grained_trial(
         # A failed primitive can still move the robot or scene. Always observe and update first.
         observation = _observe(env)
         state = components.memory.update_after_execution(context, call, result, observation)
-        verdict = components.verifier.check(call, state, result)
-        components.memory.record_verdict(context, call, result, verdict, state)
-        components.planner.observe_turn(stage, scheduled.role, result, verdict)
+        reward_context = StageRewardContext(
+            turn=context,
+            call=call,
+            result=result,
+            state_before=state_before,
+            state_after=copy.deepcopy(state),
+            rules=call.reward_rules,
+        )
+        stage_reward = components.verifier.compute_reward(reward_context)
+        components.memory.record_stage_reward(context, call, result, stage_reward, state)
+        components.planner.observe_turn(stage, scheduled.role, result, stage_reward)
+        current_record["reward"] = stage_reward.reward
+        current_record["reward_valid"] = stage_reward.reward_valid
+        current_record["reward_status"] = stage_reward.status.value
+        current_record["reward_code"] = stage_reward.code
         trace.append(
             _trace_line(
                 turn,
-                "verdict",
+                "stage_reward",
                 stage_id=stage.id,
                 turn_role=scheduled.role.value,
                 call_id=call.id,
                 tool_ok=result.ok,
                 tool_code=result.code,
-                status=verdict.status.value,
-                verdict_code=verdict.code,
+                reward=stage_reward.reward,
+                reward_valid=stage_reward.reward_valid,
+                status=stage_reward.status.value,
+                reward_code=stage_reward.code,
+                evidence=stage_reward.evidence,
+                tool_trace=stage_reward.tool_trace,
             )
         )
 
@@ -393,7 +435,7 @@ def run_fine_grained_trial(
             TurnRole.RETRY,
             TurnRole.RESTAGE_RETRY,
         }
-        if verdict.status is VerdictStatus.SUCCESS and is_primary_attempt:
+        if stage_reward.status is RewardStatus.SUCCESS and is_primary_attempt:
             current_record["status"] = "success"
             current_record["retries_used"] = retry_used
             current_record["restages_used"] = restage_used
@@ -413,9 +455,17 @@ def run_fine_grained_trial(
         if _task_completed(env):
             stop_reason = "task_completed"
             break
-        if verdict.status is VerdictStatus.SUCCESS:
+        if stage_reward.status is RewardStatus.SUCCESS:
             continue
-        if verdict.status is VerdictStatus.UNSAFE:
+        if stage_reward.status is RewardStatus.UNSAFE:
+            components.memory.record_recovery(
+                context,
+                RecoveryDecision(
+                    action=RecoveryAction.ABORT,
+                    message=f"unsafe:{stage_reward.code}",
+                ),
+                state,
+            )
             current_record["status"] = "aborted"
             current_record["retries_used"] = retry_used
             current_record["restages_used"] = restage_used
@@ -425,15 +475,23 @@ def run_fine_grained_trial(
                     "stage_aborted",
                     stage_id=stage.id,
                     turn_role=scheduled.role.value,
-                    reason=f"unsafe:{verdict.code}",
+                    reason=f"unsafe:{stage_reward.code}",
                 )
             )
-            stop_reason = f"unsafe:{verdict.code}"
+            stop_reason = f"unsafe:{stage_reward.code}"
             break
 
         # A failed repair invalidates the recovery sequence. It is never recursively recovered.
         if scheduled.role is TurnRole.RESTAGE:
             pending_calls.clear()
+            components.memory.record_recovery(
+                context,
+                RecoveryDecision(
+                    action=RecoveryAction.REPLAN,
+                    message="restage repair failed",
+                ),
+                state,
+            )
             trace.append(
                 _trace_line(
                     turn,
@@ -456,15 +514,16 @@ def run_fine_grained_trial(
                     "stage_failed",
                     stage_id=stage.id,
                     turn_role=scheduled.role.value,
-                    reason=verdict.code,
+                    reason=stage_reward.code,
                 )
             )
-            components.planner.replan(task_text, state, stage, verdict)
+            components.planner.replan(task_text, state, stage, stage_reward)
             current_stage = None
             current_record = None
             continue
 
-        decision = components.recovery_policy.decide(call, state, verdict, retry_used)
+        decision = components.recovery_policy.decide(call, state, stage_reward, retry_used)
+        components.memory.record_recovery(context, decision, state)
         trace.append(
             _trace_line(
                 turn,
@@ -507,7 +566,7 @@ def run_fine_grained_trial(
                         reason="retry_budget_exhausted",
                     )
                 )
-                components.planner.replan(task_text, state, stage, verdict)
+                components.planner.replan(task_text, state, stage, stage_reward)
                 current_stage = None
                 current_record = None
                 continue
@@ -541,7 +600,7 @@ def run_fine_grained_trial(
                         reason="restage_budget_exhausted",
                     )
                 )
-                components.planner.replan(task_text, state, stage, verdict)
+                components.planner.replan(task_text, state, stage, stage_reward)
                 current_stage = None
                 current_record = None
                 continue
@@ -569,10 +628,10 @@ def run_fine_grained_trial(
                     "stage_failed",
                     stage_id=stage.id,
                     turn_role=scheduled.role.value,
-                    reason=verdict.code,
+                    reason=stage_reward.code,
                 )
             )
-            components.planner.replan(task_text, state, stage, verdict)
+            components.planner.replan(task_text, state, stage, stage_reward)
             current_stage = None
             current_record = None
         else:
@@ -586,23 +645,24 @@ def run_fine_grained_trial(
                     "stage_aborted",
                     stage_id=stage.id,
                     turn_role=scheduled.role.value,
-                    reason=verdict.code,
+                    reason=stage_reward.code,
                 )
             )
-            stop_reason = f"aborted:{verdict.code}"
+            stop_reason = f"aborted:{stage_reward.code}"
             break
 
     task_completed = _task_completed(env)
     reward = _reward(env)
     if task_completed:
         stop_reason = "task_completed"
+    components.memory.finalize(task_completed)
     trace.append(
         _trace_line(
             turns_executed,
             "trial_finished",
             stop_reason=stop_reason,
             task_completed=task_completed,
-            reward=reward,
+            task_reward=reward,
         )
     )
 
@@ -686,6 +746,11 @@ __all__ = [
     "RecoveryAction",
     "RecoveryDecision",
     "RecoveryPolicy",
+    "RewardStatus",
+    "StageReward",
+    "StageRewardContext",
+    "StageRewardRule",
+    "StageRewardVerifier",
     "ToolCall",
     "ToolExecutor",
     "ToolResult",

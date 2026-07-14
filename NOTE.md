@@ -62,10 +62,15 @@ stays below `FineGrainedTrialExecutor`.
 A trial remains one complete task attempt. Only its inner loop changes:
 
 ```text
-observe → choose one ToolCall → execute → verify
-        ↑                              │
-        └─ retry / re-stage / replan ─────────┘
+observe → choose one ToolCall → execute → compute Stage reward
+        ↑                                           │
+        └──────── retry / re-stage / replan ────────┘
 ```
+
+The benchmark owns the final Task reward through `compute_reward()` and `task_completed()`.
+Each physical turn has a separate binary `StageReward`: an agent turns structured
+`StageRewardRule` entries into concrete read-only checking code, and the Stage planner uses the
+result to advance or recover.
 
 ## Fine-grained trial migration TODO
 
@@ -73,7 +78,7 @@ observe → choose one ToolCall → execute → verify
 
 Build a primitive-level, closed-loop Agentic Planner in which the planner emits one structured
 `ToolCall` per turn. Every physical attempt must be followed by a refreshed observation,
-post-condition verification, explicit state update, and a decision to advance, retry, re-stage,
+binary Stage reward computation, explicit state update, and a decision to advance, retry, re-stage,
 replan, or stop. VLA is one contact-rich primitive rather than the end-to-end task controller.
 
 ### Current versus target
@@ -83,7 +88,7 @@ replan, or stop. VLA is one contact-rich primitive rather than the end-to-end ta
 | One turn executes generated Python | One turn executes one `ToolCall` |
 | Recovery regenerates code | Recovery selects retry, re-stage, replan, or abort |
 | State mainly lives in Python globals | State lives in explicit `WorldState` and Memory |
-| API return is treated as execution completion | Verifier checks physical post-conditions |
+| API return is treated as execution completion | Agentic verifier computes a physical Stage reward |
 | VLA may be called freely from code | VLA is restricted to local contact-rich phases |
 | Metrics describe code blocks | Metrics describe stages, tools, failures, and recovery |
 
@@ -92,10 +97,10 @@ replan, or stop. VLA is one contact-rich primitive rather than the end-to-end ta
 - [ ] Implement `build_fine_grained_components(env, ...)`.
 - [ ] Complete a `FineGrainedPlanner` whose symbolic `StagePlan` defines each Stage as exactly one
       primary primitive; retries and re-stage repairs remain turns inside that Stage.
-- [ ] Implement layered `TrialMemory`: episode `WorldState` and attempt trace, a task-specific
-      symbolic solution skeleton, and a read-only P0 global-rule interface.
-- [ ] Implement an evidence-backed `Verifier` that separates primitive post-conditions from the
-      official task predicate and returns `SUCCESS`, `FAILURE`, `UNKNOWN`, or `UNSAFE`.
+- [x] Implement hierarchical Memory: Global Memory shared by every task, Task Memory shared by
+      trials of one task, and Trial Memory for one trial's `WorldState` and attempt trace.
+- [x] Implement structured `StageRewardRule`, an Agent-authored read-only reward program, and an
+      evidence-backed binary `StageReward` separate from the official Task reward.
 - [ ] Implement a typed failure taxonomy and `RecoveryPolicy`.
 - [x] Add trial-executor dispatch selected by `trial_executor.type` in environment YAML.
 - [ ] Add an embodiment-specific YAML that selects `fine_grained` and a real component factory.
@@ -112,7 +117,8 @@ Detailed P0.2/P0.3/P0.4 specifications and paper notes are in
 - [ ] Add workspace, collision, velocity, and unsafe-state checks.
 - [ ] Replace the naive same-name function fallback with explicit primitive schemas and
       embodiment capability descriptors.
-- [ ] Add a safe predicate registry for VLA stop conditions and verifier post-conditions.
+- [ ] Extend the read-only verification tool registry with production perception adapters and add
+      a separate safe predicate registry for VLA internal stop conditions.
 - [ ] Re-localize after robot, camera, object, base, fixture, or grasp-state changes.
 
 ### P2: recovery and memory
@@ -121,7 +127,7 @@ Detailed P0.2/P0.3/P0.4 specifications and paper notes are in
 - [ ] Implement initial failure codes such as `EMPTY_GRASP`, `OBJECT_DROPPED`,
       `IK_UNREACHABLE`, `PLACEMENT_SHORT`, `VLA_NO_EFFECT`, and `WRONG_TARGET`.
 - [ ] Ensure every re-stage repair call uses the same execute-observe-verify path.
-- [ ] Add Episode Memory, parameterized Task Specific Memory, and Global Memory.
+- [x] Add Trial Memory, parameterized Task Memory, and read-only Global Memory.
 - [ ] Store successful procedural structure without replaying literal coordinates.
 - [ ] Track turn, VLA chunk, retry, re-stage, replan, environment-step, and wall-time budgets.
 
@@ -130,7 +136,7 @@ Detailed P0.2/P0.3/P0.4 specifications and paper notes are in
 - [ ] Add fine-grained summary fields: tool calls, VLA calls, retries, re-stages, replans,
       failure codes, trace path, and audit path.
 - [ ] Save fine-grained partial artifacts incrementally so timeout reports include the last
-      `ToolCall`, verdict, and `WorldState`.
-- [ ] Add Web UI events for stage, tool call, tool result, verification, recovery, and budget.
+      `ToolCall`, Stage reward, and `WorldState`.
+- [ ] Add Web UI events for stage, tool call, tool result, Stage reward, recovery, and budget.
 - [ ] Make headless and Web UI consume the same trial executor instead of duplicating loops.
 - [ ] Add regression comparisons for code-agent, VLA-only, retry-only, and re-stage trials.

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from capx.envs.stage_planner import Stage, TurnContext, TurnRole
 from capx.envs.trial_fine_grained import (
     FineGrainedTrialComponents,
     FineGrainedTrialConfig,
@@ -11,10 +10,10 @@ from capx.envs.trial_fine_grained import (
     RecoveryDecision,
     ToolCall,
     ToolResult,
-    VerificationVerdict,
-    VerdictStatus,
     run_fine_grained_trial,
 )
+from capx.planning.stage_planner import Stage, TurnContext, TurnRole
+from capx.planning.stage_reward import RewardStatus, StageReward
 
 
 class FakeEnv:
@@ -46,7 +45,7 @@ class FakePlanner:
         self.stages = list(stages)
         self.index = 0
         self.initialized_with: tuple[str, dict[str, Any]] | None = None
-        self.results: list[tuple[str, TurnRole, VerdictStatus]] = []
+        self.results: list[tuple[str, TurnRole, RewardStatus]] = []
         self.replans = 0
 
     def initialize(self, task: str, state: dict[str, Any]) -> None:
@@ -57,7 +56,7 @@ class FakePlanner:
 
     def observe_turn(self, stage, role, result, verdict) -> None:
         self.results.append((stage.id, role, verdict.status))
-        if role is not TurnRole.RESTAGE and verdict.status is VerdictStatus.SUCCESS:
+        if role is not TurnRole.RESTAGE and verdict.status is RewardStatus.SUCCESS:
             self.index += 1
 
     def replan(self, task, state, failed_stage, verdict) -> None:
@@ -69,8 +68,10 @@ class FakeMemory:
     def __init__(self) -> None:
         self.state: dict[str, Any] = {}
         self.observed_after: list[str] = []
-        self.verdicts: list[VerdictStatus] = []
+        self.rewards: list[RewardStatus] = []
         self.contexts: list[TurnContext] = []
+        self.recoveries: list[RecoveryAction] = []
+        self.finalized: bool | None = None
 
     def bootstrap(self, task: str, observation: dict[str, Any]) -> dict[str, Any]:
         self.state = {"task": task, "observation": observation}
@@ -86,15 +87,21 @@ class FakeMemory:
         }
         return self.state
 
-    def record_verdict(self, context, call, result, verdict, state) -> None:
-        self.verdicts.append(verdict.status)
+    def record_stage_reward(self, context, call, result, reward, state) -> None:
+        self.rewards.append(reward.status)
+
+    def record_recovery(self, context, decision, state) -> None:
+        self.recoveries.append(decision.action)
+
+    def finalize(self, success: bool) -> None:
+        self.finalized = success
 
 
 class ResultVerifier:
-    def check(self, call, state, result) -> VerificationVerdict:
-        return VerificationVerdict(
-            status=VerdictStatus.SUCCESS if result.ok else VerdictStatus.FAILURE,
-            code="postcondition_met" if result.ok else result.code,
+    def compute_reward(self, context) -> StageReward:
+        return StageReward(
+            status=RewardStatus.SUCCESS if context.result.ok else RewardStatus.FAILURE,
+            code="reward_met" if context.result.ok else context.result.code,
         )
 
 
@@ -142,7 +149,8 @@ def test_fine_grained_trial_observes_and_verifies_after_one_tool_call() -> None:
     assert summary.num_code_blocks == 1
     assert executor.actions == ["VLA"]
     assert memory.observed_after == ["VLA"]
-    assert memory.verdicts == [VerdictStatus.SUCCESS]
+    assert memory.rewards == [RewardStatus.SUCCESS]
+    assert memory.finalized is True
     assert memory.contexts == [TurnContext(0, "grasp", TurnRole.PRIMARY)]
     assert summary.num_stages == 1
     assert summary.num_stages_completed == 1
@@ -150,7 +158,7 @@ def test_fine_grained_trial_observes_and_verifies_after_one_tool_call() -> None:
     assert [event["event"] for event in _events(summary)] == [
         "stage_started",
         "tool_call",
-        "verdict",
+        "stage_reward",
         "stage_completed",
         "trial_finished",
     ]
@@ -213,10 +221,10 @@ def test_fine_grained_trial_runs_restage_calls_through_same_closed_loop() -> Non
     assert summary.task_completed is True
     assert executor.actions == ["VLA", "MOVE_EEF", "VLA"]
     assert memory.observed_after == ["VLA", "MOVE_EEF", "VLA"]
-    assert memory.verdicts == [
-        VerdictStatus.FAILURE,
-        VerdictStatus.SUCCESS,
-        VerdictStatus.SUCCESS,
+    assert memory.rewards == [
+        RewardStatus.FAILURE,
+        RewardStatus.SUCCESS,
+        RewardStatus.SUCCESS,
     ]
     assert any(event["event"] == "recovery" for event in _events(summary))
     assert [context.role for context in memory.contexts] == [
@@ -226,6 +234,7 @@ def test_fine_grained_trial_runs_restage_calls_through_same_closed_loop() -> Non
     ]
     assert {context.stage_id for context in memory.contexts} == {"grasp"}
     assert summary.stage_records[0]["restages_used"] == 1
+    assert memory.recoveries == [RecoveryAction.RESTAGE]
 
 
 class SequenceExecutor:
@@ -358,9 +367,13 @@ def test_failed_repair_cancels_remaining_repairs_and_replans() -> None:
 
 
 class UnsafeVerifier:
-    def check(self, call, state, result) -> VerificationVerdict:
-        status = VerdictStatus.UNSAFE if result.code == "collision" else VerdictStatus.FAILURE
-        return VerificationVerdict(status=status, code=result.code)
+    def compute_reward(self, context) -> StageReward:
+        status = (
+            RewardStatus.UNSAFE
+            if context.result.code == "collision"
+            else RewardStatus.FAILURE
+        )
+        return StageReward(status=status, code=context.result.code)
 
 
 def test_unsafe_repair_aborts_stage_and_trial_immediately() -> None:

@@ -40,8 +40,9 @@ Properties relevant to our implementation:
 - Spatial values from a reference rollout are not replayed; targets are re-grounded from the
   current observation.
 - VLA calls are sparse, short local attempts with bounded chunk budgets and stop conditions.
-- A primitive post-condition only ends that primitive. It is not a replacement for the
-  benchmark-provided task completion predicate.
+- A primitive's internal stop condition returns control to the planner. The separate Stage reward
+  decides whether its intended effect was achieved, and neither replaces the benchmark-provided
+  task completion predicate.
 - Planner-visible state must not expose privileged simulator poses or controller internals.
 
 This maps naturally onto our existing loop:
@@ -52,7 +53,7 @@ FineGrainedPlanner.next_stage()
   -> ToolBackedPrimitiveExecutor.execute()
   -> refreshed observation
   -> TrialMemory.update_after_execution()
-  -> Verifier.check()
+  -> StageRewardVerifier.compute_reward()
   -> RecoveryPolicy.decide()
 ```
 
@@ -114,8 +115,8 @@ symbolic targets such as `red_cup` and `sink_region`, not reference-scene coordi
 4. Use `VLA_ACT` only for a local contact-rich stage and supply the current semantic target in its
    prompt.
 5. Emit one Stage (and therefore one primary `ToolCall`) per `next_stage()` progression.
-6. Advance a stage only after the Verifier returns success for its predicate.
-7. After failure, consume the recorded verdict/recovery outcome before choosing another planner
+6. Advance a stage only after the Stage reward is `1.0/SUCCESS` for its rules.
+7. After failure, consume the recorded reward/recovery outcome before choosing another planner
    call. Do not blindly replay the last call.
 8. Stop only on official task success, budget exhaustion, unrecoverability, or an explicit planner
    completion after all stages are verified.
@@ -129,14 +130,28 @@ symbolic targets such as `red_cup` and `sink_region`, not reference-scene coordi
 - A failed grasp does not advance to transport.
 - A re-stage call completes before the failed VLA call is scheduled again.
 
-## Refined P0.3: TrialMemory
+## Refined P0.3: hierarchical Memory
 
-Harness VLA separates two persistent memories. Task Specific Memory contains a successful
-task-level solution skeleton plus a semantic audit; Global Memory contains task-independent
-success rules and failure models. Our runtime additionally needs Episode Memory to represent the
-currently executing rollout.
+Memory is organized from the widest to the narrowest scope:
 
-### Episode Memory: required in P0
+```text
+Global Memory: shared by every task
+└── Task Memory: shared by all trials of one task
+    └── Trial Memory: state and trace for one trial only
+```
+
+The implementation mirrors these scopes under `capx/memory/`: `global_memory.py` owns shared
+rules and failure models, `task_memory.py` owns per-task successful symbolic experience, and
+`trial_memory.py` owns the mutable state and attempt trace for one rollout. Stage planning and
+Agentic Stage reward evaluation live separately under `capx/planning/`; `capx/envs/` only owns
+environment and Trial orchestration.
+
+Harness VLA's persistent layers are Task Memory, which contains a successful task-level solution
+skeleton plus a semantic audit, and Global Memory, which contains task-independent success rules
+and failure models. Our runtime Trial Memory represents the currently executing rollout and is
+the lowest layer of this hierarchy.
+
+### Trial Memory: required in P0
 
 `TrialMemory` should own the current `WorldState` and an append-only attempt trace:
 
@@ -161,18 +176,19 @@ Each attempt record should contain:
   re-stage retry;
 - normalized `ToolResult` and execution telemetry;
 - post-execution observation reference and robot state;
-- `VerificationVerdict`, evidence, failure code, and recovery decision;
+- `StageReward`, evidence, generated reward code, tool trace, failure code, and recovery decision;
 - stage and budget counters before/after the call.
 
 Memory update ordering is an invariant:
 
 ```text
-execute -> observe -> update state -> verify -> record verdict -> decide recovery
+execute -> observe -> update state -> compute reward -> record Stage reward -> decide recovery
+        -> record recovery
 ```
 
 Failed primitives must still update state because they may have moved the robot or scene.
 
-### Task Specific Memory: minimal P0 interface
+### Task Memory: minimal P0 interface
 
 Represent a solved reference task with two artifacts, following the paper:
 
@@ -183,7 +199,7 @@ P0 only needs load/save and retrieval by task identity. Before reuse, literal `x
 pixel, object-pose, fixture, and base-pose bindings must be removed or marked as reference-only.
 Only the symbolic stage structure is passed to the planner.
 
-### Global Memory: P0 stub, later learning
+### Global Memory: P0 read-only, later learning
 
 Expose a read-only interface returning success rules and failure models. It may start from a small
 static file, for example:
@@ -193,7 +209,8 @@ static file, for example:
 - visual proximity alone is not final success;
 - re-localize and re-stage before retrying an unchanged failed contact attempt.
 
-Automatic cross-task distillation and trace replacement belong to P2, not P0.
+Global Memory is never updated by an individual trial in P0. Automatic cross-task distillation
+and trace replacement belong to P2, not P0.
 
 ### P0 acceptance cases
 
@@ -203,34 +220,50 @@ Automatic cross-task distillation and trace replacement belong to P2, not P0.
 - A successful trace can be serialized to JSONL and loaded as a symbolic skeleton.
 - No planner-facing memory field exposes privileged simulator object poses.
 
-## Refined P0.4: basic Verifier
+## Refined P0.4: agentic Stage reward
 
 ### Two levels of success
 
 The verifier must keep these separate:
 
-1. **Primitive post-condition**: determines whether the local call achieved its intended effect
-   and whether the planner may advance the current stage.
+1. **Stage reward rule**: determines whether the local call achieved its intended effect and
+   produces a binary `stage_reward` used by Stage control flow.
 2. **Official task predicate**: the environment/benchmark completion signal; this is the only
-   authority for reporting task success.
+   authority for reporting task success and the final Task reward.
 
 `ToolResult.ok` means that the underlying function returned successfully. It is evidence, not a
 physical-success verdict.
 
-### Interface and verdict
+### Structured rule and reward
 
 ```python
-VerificationVerdict(
+StageRewardRule(
+    predicate="object_stably_grasped",
+    description="The requested cup must be stably held.",
+    target="cup",
+    required_evidence=("holding", "object_motion"),
+    allowed_tools=("read_holding", "compare_object_motion"),
+)
+
+StageReward(
+    reward=1.0,
     status=SUCCESS | FAILURE | UNKNOWN | UNSAFE,
+    reward_valid=True,
     code="object_in_gripper",
-    message="...",
     evidence={...},
 )
 ```
 
-`Verifier.check()` consumes the call, normalized result, previous state, refreshed state, and
-latest observation evidence. The current protocol may initially retrieve previous state through
-Memory, but the interface should eventually make the before/after states explicit.
+`StageRewardVerifier.compute_reward()` receives an explicit `StageRewardContext` containing the
+call, normalized result, Turn metadata, reward rules, and before/after states. An injected code
+agent writes the concrete `compute_reward(...)` function. A dedicated sandbox executes that code
+against copied state and approved read-only evidence tools; it cannot control the robot, mutate
+the environment, access files, use the network, or import arbitrary modules.
+
+`SUCCESS` is `reward=1.0`; valid physical failure and `UNSAFE` are `reward=0.0`;
+missing evidence or verifier execution failure is `UNKNOWN`, represented by
+`reward=0.0, reward_valid=False`. Planner control flow continues to use status so an unknown
+observation is not confused with a confirmed failure.
 
 ### Minimum P0 checks
 
@@ -240,19 +273,20 @@ Memory, but the interface should eventually make the before/after states explici
   A closed gripper or plausible-looking image alone is insufficient.
 - Release: gripper is open, the object no longer follows the end effector, and target-region
   evidence is present when the stage requires placement.
-- VLA non-grasp contact: use the call's named post-condition and before/after evidence; a chunk
+- VLA non-grasp contact: use the call's named reward rule and before/after evidence; a chunk
   budget or VLA return is not automatically success.
 - Official completion: query the benchmark-provided `task_completed()` after every primitive and
   at termination. It overrides visual guesses about final success.
 
-If evidence is missing or contradictory, return `UNKNOWN`, not `SUCCESS`. Recovery can then
+If required evidence is missing, return `UNKNOWN`, not `SUCCESS`. Recovery can then
 request another observation, re-stage, replan, or abort according to budget and safety policy.
 
 ### Evidence discipline
 
-Every verdict should record the observation IDs, relevant robot fields, tool status, predicate
-evaluated, and measured/observed reason. This makes false success, empty grasps, wrong targets,
-short placements, and no-effect VLA calls diagnosable instead of collapsing them into a boolean.
+Every Stage reward record stores its rules, generated code, observation IDs, relevant robot
+fields, tool status, evidence-tool trace, and measured/observed reason. This makes false success,
+empty grasps, wrong targets, short placements, and no-effect VLA calls diagnosable instead of
+collapsing them into a boolean.
 
 ### P0 acceptance cases
 
@@ -265,6 +299,6 @@ short placements, and no-effect VLA calls diagnosable instead of collapsing them
 ## What remains outside P0
 
 P0 may use coarse pose checks, mock perception, static global rules, and a deterministic stage
-planner. Precise RGB-D grounding, coordinate-frame schemas, safe predicate registries, controller
-timeouts, collision/velocity checks, automatic memory distillation, and production VLA stop
-conditions remain P1/P2 work.
+planner. Precise RGB-D grounding, coordinate-frame schemas, production evidence-tool adapters,
+controller timeouts, collision/velocity checks, automatic memory distillation, and production VLA
+stop conditions remain P1/P2 work.

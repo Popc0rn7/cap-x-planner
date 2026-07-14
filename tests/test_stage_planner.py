@@ -2,19 +2,15 @@ from __future__ import annotations
 
 import pytest
 
-from capx.envs.stage_planner import (
+from capx.envs.trial_fine_grained import ToolCall, ToolResult
+from capx.planning.stage_planner import (
     Stage,
     StagePlan,
     StagePlanner,
     StageStatus,
     TurnRole,
 )
-from capx.envs.trial_fine_grained import (
-    ToolCall,
-    ToolResult,
-    VerificationVerdict,
-    VerdictStatus,
-)
+from capx.planning.stage_reward import RewardStatus, StageReward
 
 
 def _stage(stage_id: str, **budgets: int) -> Stage:
@@ -26,8 +22,8 @@ def _stage(stage_id: str, **budgets: int) -> Stage:
     )
 
 
-def _verdict(status: VerdictStatus) -> VerificationVerdict:
-    return VerificationVerdict(status=status, code=status.value)
+def _reward(status: RewardStatus) -> StageReward:
+    return StageReward(status=status, code=status.value)
 
 
 class StaticBuilder:
@@ -69,7 +65,7 @@ def test_planner_returns_stages_in_order_and_only_advances_on_primary_success() 
         first,
         TurnRole.PRIMARY,
         ToolResult(ok=False, code="failed"),
-        _verdict(VerdictStatus.FAILURE),
+        _reward(RewardStatus.FAILURE),
     )
     assert planner.next_stage("task", {}) is first
     assert planner.progress is not None
@@ -79,7 +75,7 @@ def test_planner_returns_stages_in_order_and_only_advances_on_primary_success() 
         first,
         TurnRole.PRIMARY,
         ToolResult(ok=True, code="done"),
-        _verdict(VerdictStatus.SUCCESS),
+        _reward(RewardStatus.SUCCESS),
     )
     assert planner.next_stage("task", {}) is second
 
@@ -93,7 +89,7 @@ def test_successful_repair_does_not_complete_stage() -> None:
         stage,
         TurnRole.RESTAGE,
         ToolResult(ok=True, code="staged"),
-        _verdict(VerdictStatus.SUCCESS),
+        _reward(RewardStatus.SUCCESS),
     )
 
     assert planner.next_stage("task", {}) is stage
@@ -111,9 +107,9 @@ def test_replan_preserves_completed_prefix_and_replaces_current_and_tail() -> No
         first,
         TurnRole.PRIMARY,
         ToolResult(ok=True, code="done"),
-        _verdict(VerdictStatus.SUCCESS),
+        _reward(RewardStatus.SUCCESS),
     )
-    verdict = _verdict(VerdictStatus.FAILURE)
+    verdict = _reward(RewardStatus.FAILURE)
 
     planner.replan("task", {"changed": True}, failed, verdict)
 
